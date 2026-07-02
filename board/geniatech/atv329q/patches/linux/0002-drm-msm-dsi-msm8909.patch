@@ -1,0 +1,353 @@
+drm/msm/dsi: msm8909 DSI host + 28nm PHY (3-lane panel path)
+
+diff --git a/drivers/gpu/drm/msm/dsi/dsi.h b/drivers/gpu/drm/msm/dsi/dsi.h
+index 93c028a12..1581094da 100644
+--- a/drivers/gpu/drm/msm/dsi/dsi.h
++++ b/drivers/gpu/drm/msm/dsi/dsi.h
+@@ -75,6 +75,10 @@ void msm_dsi_host_disable_irq(struct mipi_dsi_host *host);
+ int msm_dsi_host_power_on(struct mipi_dsi_host *host,
+ 			struct msm_dsi_phy_shared_timings *phy_shared_timings,
+ 			bool is_bonded_dsi, struct msm_dsi_phy *phy);
++/* HACK(atv329q): adopt lk2nd's already-running DSI host without resetting it */
++int msm_dsi_host_adopt(struct mipi_dsi_host *host);
++/* HACK(atv329q): lk2nd-style settle + poll for VIDEO_DONE after enable */
++void msm_dsi_host_wait_video(struct mipi_dsi_host *host);
+ int msm_dsi_host_power_off(struct mipi_dsi_host *host);
+ int msm_dsi_host_set_display_mode(struct mipi_dsi_host *host,
+ 				  const struct drm_display_mode *mode);
+diff --git a/drivers/gpu/drm/msm/dsi/dsi_cfg.c b/drivers/gpu/drm/msm/dsi/dsi_cfg.c
+index bd3c51c35..7006a3ce3 100644
+--- a/drivers/gpu/drm/msm/dsi/dsi_cfg.c
++++ b/drivers/gpu/drm/msm/dsi/dsi_cfg.c
+@@ -63,7 +63,8 @@ static const struct msm_dsi_config msm8916_dsi_cfg = {
+ 	.bus_clk_names = dsi_v1_3_1_clk_names,
+ 	.num_bus_clks = ARRAY_SIZE(dsi_v1_3_1_clk_names),
+ 	.io_start = {
+-		{ 0x1a98000 },
++		{ 0x1a98000 },		/* msm8916 DSI0 */
++		{ 0x1ac8000 },		/* msm8909 DSI0 (same v1.3.1 ctrl, different base) */
+ 	},
+ };
+ 
+diff --git a/drivers/gpu/drm/msm/dsi/dsi_host.c b/drivers/gpu/drm/msm/dsi/dsi_host.c
+index db6da9937..99facc18a 100644
+--- a/drivers/gpu/drm/msm/dsi/dsi_host.c
++++ b/drivers/gpu/drm/msm/dsi/dsi_host.c
+@@ -1226,6 +1226,10 @@ int dsi_tx_buf_alloc_6g(struct msm_dsi_host *msm_host, int size)
+ 	uint64_t iova;
+ 	u8 *data;
+ 
++	/* No display IOMMU (e.g. MDP3): use the contiguous v2 allocation */
++	if (!priv->kms->vm)
++		return dsi_tx_buf_alloc_v2(msm_host, size);
++
+ 	msm_host->vm = drm_gpuvm_get(priv->kms->vm);
+ 
+ 	data = msm_gem_kernel_new(dev, size, MSM_BO_WC,
+@@ -1286,6 +1290,10 @@ void msm_dsi_tx_buf_free(struct mipi_dsi_host *host)
+ 
+ void *dsi_tx_buf_get_6g(struct msm_dsi_host *msm_host)
+ {
++	/* tx_buf set => the v2 contiguous allocation was used (no kms->vm) */
++	if (msm_host->tx_buf)
++		return msm_host->tx_buf;
++
+ 	return msm_gem_get_vaddr(msm_host->tx_gem_obj);
+ }
+ 
+@@ -1296,6 +1304,10 @@ void *dsi_tx_buf_get_v2(struct msm_dsi_host *msm_host)
+ 
+ void dsi_tx_buf_put_6g(struct msm_dsi_host *msm_host)
+ {
++	/* tx_buf set => the v2 contiguous allocation was used (no kms->vm) */
++	if (msm_host->tx_buf)
++		return;
++
+ 	msm_gem_put_vaddr(msm_host->tx_gem_obj);
+ }
+ 
+@@ -1406,6 +1418,9 @@ int dsi_dma_base_get_6g(struct msm_dsi_host *msm_host, uint64_t *dma_base)
+ 	if (!dma_base)
+ 		return -EINVAL;
+ 
++	if (msm_host->tx_buf)
++		return dsi_dma_base_get_v2(msm_host, dma_base);
++
+ 	return msm_gem_get_and_pin_iova(msm_host->tx_gem_obj,
+ 				priv->kms->vm, dma_base);
+ }
+@@ -1425,6 +1440,7 @@ static int dsi_cmd_dma_tx(struct msm_dsi_host *msm_host, int len)
+ 	int ret;
+ 	uint64_t dma_base;
+ 	bool triggered;
++	u32 vid_ctrl = 0;
+ 
+ 	ret = cfg_hnd->ops->dma_base_get(msm_host, &dma_base);
+ 	if (ret) {
+@@ -1436,6 +1452,21 @@ static int dsi_cmd_dma_tx(struct msm_dsi_host *msm_host, int len)
+ 
+ 	dsi_wait4video_eng_busy(msm_host);
+ 
++	/*
++	 * HACK(atv329q): in pure video mode the command DMA never drains (the LP
++	 * command can't find a BLLP escape window) -> dma_comp times out
++	 * (-ETIMEDOUT) and the ADV7533 display_on DCS is never delivered -> the
++	 * chip detects the timing (VIC) but never forwards -> HDMI black.  lk2nd
++	 * works around this by enabling the command-mode engine alongside video
++	 * (CTRL |= CMD_MODE_EN) for the duration of the command, then restoring
++	 * video-only.  Replicate that so the DCS actually gets out.
++	 */
++	if (msm_host->mode_flags & MIPI_DSI_MODE_VIDEO) {
++		vid_ctrl = dsi_read(msm_host, REG_DSI_CTRL);
++		dsi_write(msm_host, REG_DSI_CTRL,
++			  vid_ctrl | DSI_CTRL_CMD_MODE_EN);
++	}
++
+ 	triggered = msm_dsi_manager_cmd_xfer_trigger(
+ 						msm_host->id, dma_base, len);
+ 	if (triggered) {
+@@ -1450,6 +1481,10 @@ static int dsi_cmd_dma_tx(struct msm_dsi_host *msm_host, int len)
+ 		ret = len;
+ 	}
+ 
++	/* restore video-only mode */
++	if (vid_ctrl)
++		dsi_write(msm_host, REG_DSI_CTRL, vid_ctrl);
++
+ 	return ret;
+ }
+ 
+@@ -1552,7 +1587,19 @@ static void dsi_err_worker(struct work_struct *work)
+ 		container_of(work, struct msm_dsi_host, err_work);
+ 	u32 status = msm_host->err_work_state;
+ 
+-	pr_err_ratelimited("%s: status=%x\n", __func__, status);
++	/*
++	 * HACK(atv329q): a bare FIFO error (no other error bit set) is, on this
++	 * MDP3 + ADV7533 setup, a recovered VIDEO_MDP FIFO underflow.  It recurs
++	 * continuously and the worker MUST keep running (it acks the underflow
++	 * via REG_DSI_FIFO_STATUS and re-enables the IRQ, which is what keeps the
++	 * DSI video FIFO alive and the picture up).  Only the logging floods the
++	 * fbcon console, so keep the FIFO-only case at debug level; still log any
++	 * real error (PLL unlock, ack/timeout/PHY, command underflow) loudly.
++	 */
++	if (status & ~DSI_ERR_STATE_FIFO)
++		pr_err_ratelimited("%s: status=%x\n", __func__, status);
++	else
++		pr_debug_ratelimited("%s: status=%x\n", __func__, status);
+ 	if (status & DSI_ERR_STATE_MDP_FIFO_UNDERFLOW)
+ 		dsi_sw_reset(msm_host);
+ 
+@@ -2439,6 +2486,61 @@ static void msm_dsi_sfpb_config(struct msm_dsi_host *msm_host, bool enable)
+ 			SFPB_GPREG_MASTER_PORT_EN(en));
+ }
+ 
++/*
++ * HACK(atv329q): seamless handover.  lk2nd already brought the DSI PHY/PLL up,
++ * configured the host and is streaming video that the ADV7533 is locked to.
++ * Do NOT reset anything (no link_clk_set_rate, no dsi_sw_reset, no
++ * dsi_ctrl_enable, no PHY reset): any of those stops/restarts the byte-clock
++ * and the chip drops its lock -> black.  We only mark the host on so the rest
++ * of the modeset/teardown bookkeeping stays balanced; the hardware is left
++ * exactly as lk2nd left it (the MDP3 just re-points its scanout).
++ */
++int msm_dsi_host_adopt(struct mipi_dsi_host *host)
++{
++	struct msm_dsi_host *msm_host = to_msm_dsi_host(host);
++
++	mutex_lock(&msm_host->dev_mutex);
++	if (msm_host->power_on) {
++		DBG("dsi host already on");
++		goto unlock_ret;
++	}
++
++	/*
++	 * Keep the MDSS power domain / runtime-PM reference held for the whole
++	 * handover (released by the normal power_off path), but touch NO clocks
++	 * and NO DSI registers.
++	 */
++	pm_runtime_get_sync(&msm_host->pdev->dev);
++
++	msm_host->power_on = true;
++	msm_host->enabled = true;
++
++unlock_ret:
++	mutex_unlock(&msm_host->dev_mutex);
++	return 0;
++}
++
++/*
++ * HACK(atv329q): replicate lk2nd's mipi_dsi_on() -- once the video engine is
++ * streaming, settle ~10ms then poll the DSI VIDEO_DONE status until a frame has
++ * actually gone out, before declaring the display up.  lk2nd does exactly this
++ * (and is 100% deterministic where our fire-and-forget VIDEO_EN is flaky): the
++ * ADV7533 only locks reliably once it sees stable, confirmed video frames.
++ */
++void msm_dsi_host_wait_video(struct mipi_dsi_host *host)
++{
++	struct msm_dsi_host *msm_host = to_msm_dsi_host(host);
++	int i;
++
++	mdelay(10);
++	for (i = 0; i < 20000; i++) {
++		if (dsi_read(msm_host, REG_DSI_INTR_CTRL) & DSI_IRQ_VIDEO_DONE)
++			return;
++		udelay(10);
++	}
++	dev_warn(&msm_host->pdev->dev, "atv329q: DSI VIDEO_DONE not seen\n");
++}
++
+ int msm_dsi_host_power_on(struct mipi_dsi_host *host,
+ 			struct msm_dsi_phy_shared_timings *phy_shared_timings,
+ 			bool is_bonded_dsi, struct msm_dsi_phy *phy)
+diff --git a/drivers/gpu/drm/msm/dsi/dsi_manager.c b/drivers/gpu/drm/msm/dsi/dsi_manager.c
+index a794c4bbe..1efb55ab1 100644
+--- a/drivers/gpu/drm/msm/dsi/dsi_manager.c
++++ b/drivers/gpu/drm/msm/dsi/dsi_manager.c
+@@ -216,10 +216,31 @@ static int dsi_mgr_bridge_power_on(struct drm_bridge *bridge)
+ 	struct mipi_dsi_host *host = msm_dsi->host;
+ 	struct msm_dsi_phy_shared_timings phy_shared_timings[DSI_MAX];
+ 	bool is_bonded_dsi = IS_BONDED_DSI();
++	struct msm_drm_private *priv = bridge->dev->dev_private;
++	bool handover = priv->kms && priv->kms->lk_handover;
+ 	int ret;
+ 
+ 	DBG("id=%d", id);
+ 
++	/*
++	 * HACK(atv329q): lk2nd already has the DSI PHY/PLL/host running and the
++	 * ADV7533 locked to it.  Adopt that state -- do NOT enable (reset) the
++	 * PHY or re-init the host; either restarts the byte-clock and the chip
++	 * drops its lock -> black.  Mark phy_enabled so teardown stays balanced.
++	 */
++	if (handover) {
++		dev_info(&msm_dsi->pdev->dev,
++			 "atv329q: DSI seamless handover -> adopt lk2nd PHY/host (no reset)\n");
++		msm_dsi->phy_enabled = true;
++		ret = msm_dsi_host_adopt(host);
++		if (ret) {
++			pr_err("%s: adopt host %d failed, %d\n", __func__, id, ret);
++			return ret;
++		}
++		msm_dsi_host_enable_irq(host);
++		return 0;
++	}
++
+ 	ret = dsi_mgr_phy_enable(id, phy_shared_timings);
+ 	if (ret)
+ 		goto phy_en_fail;
+@@ -263,6 +284,7 @@ static void dsi_mgr_bridge_pre_enable(struct drm_bridge *bridge)
+ 	int id = dsi_mgr_bridge_get_id(bridge);
+ 	struct msm_dsi *msm_dsi = dsi_mgr_get_dsi(id);
+ 	bool is_bonded_dsi = IS_BONDED_DSI();
++	struct msm_drm_private *priv = bridge->dev->dev_private;
+ 	int ret;
+ 
+ 	DBG("id=%d", id);
+@@ -276,6 +298,7 @@ static void dsi_mgr_bridge_pre_enable(struct drm_bridge *bridge)
+ 		dev_err(&msm_dsi->pdev->dev, "Power on failed: %d\n", ret);
+ 		return;
+ 	}
++	(void)priv;
+ }
+ 
+ static void dsi_mgr_bridge_enable(struct drm_bridge *bridge)
+@@ -285,10 +308,29 @@ static void dsi_mgr_bridge_enable(struct drm_bridge *bridge)
+ 	struct msm_dsi *msm_dsi1 = dsi_mgr_get_dsi(DSI_1);
+ 	struct mipi_dsi_host *host = msm_dsi->host;
+ 	bool is_bonded_dsi = IS_BONDED_DSI();
++	struct msm_drm_private *priv = bridge->dev->dev_private;
+ 	int ret;
+ 
+ 	DBG("id=%d", id);
+ 
++	/*
++	 * HACK(atv329q): on the lk2nd handover the host video engine is already
++	 * streaming -- msm_dsi_host_adopt() already set enabled.  Re-running
++	 * msm_dsi_host_enable() reconfigures the op mode and can disturb the
++	 * running stream; skip it.
++	 */
++	if (priv->kms && priv->kms->lk_handover)
++		return;
++
++	/*
++	 * HACK(atv329q) ÉTAPE 1: defer the video stream to the ADV7533 bridge so
++	 * the chip is fully configured + HDMI-armed BEFORE the stream starts
++	 * (lk2nd ordering).  The adv bridge's atomic_enable runs after this and
++	 * calls msm_dsi_host_enable() at the end of adv7533_atv329q_lk2nd_program().
++	 */
++	if (priv->kms && priv->kms->lk_seq)
++		return;
++
+ 	/* Do nothing with the host if it is slave-DSI in case of bonded DSI */
+ 	if (is_bonded_dsi && !IS_MASTER_DSI_LINK(id))
+ 		return;
+diff --git a/drivers/gpu/drm/msm/dsi/phy/dsi_phy_28nm.c b/drivers/gpu/drm/msm/dsi/phy/dsi_phy_28nm.c
+index d00e415b9..531384fe3 100644
+--- a/drivers/gpu/drm/msm/dsi/phy/dsi_phy_28nm.c
++++ b/drivers/gpu/drm/msm/dsi/phy/dsi_phy_28nm.c
+@@ -202,6 +202,20 @@ static int dsi_pll_28nm_clk_set_rate(struct clk_hw *hw, unsigned long rate,
+ 	writel(0x06, base + REG_DSI_28nm_PHY_PLL_CAL_CFG4);
+ 	writel(0x0d, base + REG_DSI_28nm_PHY_PLL_LKDET_CFG2);
+ 
++	/*
++	 * HACK(atv329q/msm8909): match the PLL analog config the vendor
++	 * bootloader and downstream kernel program on this silicon (read
++	 * back from a working display on both): CAL_CFG4 = 0x66,
++	 * VREG_CFG = 0x02, and SDM_CFG1 with the reset bit6 cleared (plain
++	 * DC_OFFSET).  The ADV7533 clock-recovery PLL loses lock with the
++	 * mainline values.
++	 */
++	if (pll_28nm->phy->cfg->quirks & DSI_PHY_28NM_QUIRK_PHY_LP) {
++		writel(0x66, base + REG_DSI_28nm_PHY_PLL_CAL_CFG4);
++		writel(0x02, base + REG_DSI_28nm_PHY_PLL_VREG_CFG);
++		sdm_cfg1 &= 0x3f;
++	}
++
+ 	writel(sdm_cfg1, base + REG_DSI_28nm_PHY_PLL_SDM_CFG1);
+ 	writel(DSI_28nm_PHY_PLL_SDM_CFG2_FREQ_SEED_7_0(sdm_cfg2),
+ 	       base + REG_DSI_28nm_PHY_PLL_SDM_CFG2);
+@@ -217,9 +231,16 @@ static int dsi_pll_28nm_clk_set_rate(struct clk_hw *hw, unsigned long rate,
+ 
+ 	writel(refclk_cfg, base + REG_DSI_28nm_PHY_PLL_REFCLK_CFG);
+ 	writel(0x00, base + REG_DSI_28nm_PHY_PLL_PWRGEN_CFG);
+-	writel(0x31, base + REG_DSI_28nm_PHY_PLL_VCOLPF_CFG);
+-	writel(sdm_cfg0, base + REG_DSI_28nm_PHY_PLL_SDM_CFG0);
+-	writel(0x12, base + REG_DSI_28nm_PHY_PLL_CAL_CFG0);
++	/* HACK(atv329q/msm8909): vendor loop-filter + cal values, see above. */
++	if (pll_28nm->phy->cfg->quirks & DSI_PHY_28NM_QUIRK_PHY_LP) {
++		writel(0x71, base + REG_DSI_28nm_PHY_PLL_VCOLPF_CFG);
++		writel(sdm_cfg0, base + REG_DSI_28nm_PHY_PLL_SDM_CFG0);
++		writel(0x0a, base + REG_DSI_28nm_PHY_PLL_CAL_CFG0);
++	} else {
++		writel(0x31, base + REG_DSI_28nm_PHY_PLL_VCOLPF_CFG);
++		writel(sdm_cfg0, base + REG_DSI_28nm_PHY_PLL_SDM_CFG0);
++		writel(0x12, base + REG_DSI_28nm_PHY_PLL_CAL_CFG0);
++	}
+ 	writel(0x30, base + REG_DSI_28nm_PHY_PLL_CAL_CFG6);
+ 	writel(0x00, base + REG_DSI_28nm_PHY_PLL_CAL_CFG7);
+ 	writel(0x60, base + REG_DSI_28nm_PHY_PLL_CAL_CFG8);
+@@ -827,7 +848,11 @@ static int dsi_28nm_phy_enable(struct msm_dsi_phy *phy,
+ 		writel(0, base + REG_DSI_28nm_PHY_LN_CFG_1(i));
+ 		writel(0, base + REG_DSI_28nm_PHY_LN_CFG_2(i));
+ 		writel(0, base + REG_DSI_28nm_PHY_LN_CFG_3(i));
+-		writel(0, base + REG_DSI_28nm_PHY_LN_CFG_4(i));
++		/*
++		 * Downstream programs LN_CFG_4 = 0x00/0x05/0x0a/0x0f per data
++		 * lane on the 28nm PHY (and LK does the same on msm8909).
++		 */
++		writel(i * 5, base + REG_DSI_28nm_PHY_LN_CFG_4(i));
+ 		writel(0, base + REG_DSI_28nm_PHY_LN_TEST_DATAPATH(i));
+ 		writel(0, base + REG_DSI_28nm_PHY_LN_DEBUG_SEL(i));
+ 		writel(0x1, base + REG_DSI_28nm_PHY_LN_TEST_STR_0(i));
+@@ -914,8 +939,8 @@ const struct msm_dsi_phy_cfg dsi_phy_28nm_lp_cfgs = {
+ 	},
+ 	.min_pll_rate = VCO_MIN_RATE,
+ 	.max_pll_rate = VCO_MAX_RATE,
+-	.io_start = { 0x1a98500 },
+-	.num_dsi_phy = 1,
++	.io_start = { 0x1a98500, 0x1ac8500 },	/* [0] msm8916, [1] msm8909 */
++	.num_dsi_phy = 2,
+ 	.quirks = DSI_PHY_28NM_QUIRK_PHY_LP,
+ };
+ 

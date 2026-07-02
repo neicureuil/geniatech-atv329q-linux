@@ -1,0 +1,30 @@
+#!/bin/sh
+# Best-effort HDMI screen lock (ADV7533 DSI->HDMI). The chip's forwarding lock is
+# non-deterministic at boot (~1/2 of boots the screen stays black; analog wall,
+# not software-fixable). Strategy, oracle-gated to avoid needless flicker:
+#   1) PASSIVELY wait for the driver to lock the chip -- 0x3e (VIC_DETECTED)==0x10
+#      -- reading only (NO blanking). On a good boot it locks on its own -> we
+#      exit with ZERO DPMS cycles (no flicker).
+#   2) Only if it never locks, DPMS off/on cycles re-arm the flaky lock.
+# 0x3e is read over i2c-0 addr 0x39 (ADV7533 MAIN map) with i2cget.
+FB=/sys/class/graphics/fb0/blank
+# -f (force): the adv7511 kernel driver owns i2c addr 0x39, so a plain i2cget
+# returns "Device or resource busy"; -f reads behind the bound driver.
+vic() { i2cget -y -f 0 0x39 0x3e 2>/dev/null; }
+case "$1" in
+  start)
+    (
+      for i in $(seq 1 60); do [ -e "$FB" ] && break; sleep 1; done
+      [ -e "$FB" ] || exit 0
+      # passive poll (no blanking): give the driver ~25s to lock the chip
+      for i in $(seq 1 25); do [ "$(vic)" = "0x10" ] && exit 0; sleep 1; done
+      # still not forwarding -> DPMS re-arm cycles (visible flicker, bad boot only)
+      for k in 1 2 3 4 5 6; do
+        echo 1 > "$FB" 2>/dev/null; sleep 1
+        echo 0 > "$FB" 2>/dev/null; sleep 2
+        [ "$(vic)" = "0x10" ] && break
+      done
+    ) &
+    ;;
+  stop) : ;;
+esac

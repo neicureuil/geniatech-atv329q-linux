@@ -1,0 +1,13 @@
+# Build outputs (copied out of the docker volume by build.sh)
+/output-images/
+
+# In-tree build dirs if anyone builds without docker (O=output)
+/output/
+/dl/
+
+# Secrets: the real WiFi config stays local (never published). Ship only the
+# wpa_supplicant.conf.example template; copy it to this path and fill it in.
+/board/geniatech/atv329q/rootfs_overlay/etc/wpa_supplicant.conf
+
+# macOS
+.DS_Store

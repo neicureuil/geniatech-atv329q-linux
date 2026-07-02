@@ -1,0 +1,1795 @@
+drm/msm: atv329q MDP3 KMS driver + wire it into the msm drm core
+
+diff --git a/drivers/gpu/drm/msm/Kconfig b/drivers/gpu/drm/msm/Kconfig
+index 250246f81..bf3dcee7e 100644
+--- a/drivers/gpu/drm/msm/Kconfig
++++ b/drivers/gpu/drm/msm/Kconfig
+@@ -79,6 +79,16 @@ config DRM_MSM_MDSS
+ 	depends on DRM_MSM
+ 	default n
+ 
++config DRM_MSM_MDP3
++	bool "Enable MDP3 support in MSM DRM driver"
++	depends on DRM_MSM
++	select DRM_MSM_KMS
++	default n
++	help
++	  Compile in support for the Mobile Display Processor v3 (MDP3) in
++	  the MSM DRM driver. It is the single-pipe display controller found
++	  in devices using the MSM8909 platform.
++
+ config DRM_MSM_MDP4
+ 	bool "Enable MDP4 support in MSM DRM driver"
+ 	depends on DRM_MSM
+diff --git a/drivers/gpu/drm/msm/Makefile b/drivers/gpu/drm/msm/Makefile
+index 8b94c5f1c..e8732df7c 100644
+--- a/drivers/gpu/drm/msm/Makefile
++++ b/drivers/gpu/drm/msm/Makefile
+@@ -44,6 +44,13 @@ msm-display-$(CONFIG_DRM_MSM_HDMI) += \
+ 	hdmi/hdmi_phy_8x74.o \
+ 	hdmi/hdmi_pll_8960.o \
+ 
++msm-display-$(CONFIG_DRM_MSM_MDP3) += \
++	disp/mdp3/mdp3_crtc.o \
++	disp/mdp3/mdp3_dsi_encoder.o \
++	disp/mdp3/mdp3_irq.o \
++	disp/mdp3/mdp3_kms.o \
++	disp/mdp3/mdp3_plane.o \
++
+ msm-display-$(CONFIG_DRM_MSM_MDP4) += \
+ 	disp/mdp4/mdp4_crtc.o \
+ 	disp/mdp4/mdp4_dsi_encoder.o \
+diff --git a/drivers/gpu/drm/msm/disp/mdp3/mdp3_crtc.c b/drivers/gpu/drm/msm/disp/mdp3/mdp3_crtc.c
+new file mode 100644
+index 000000000..eba9d2bdb
+--- /dev/null
++++ b/drivers/gpu/drm/msm/disp/mdp3/mdp3_crtc.c
+@@ -0,0 +1,247 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * MDP3 CRTC = the DMA_P engine, modeled on the MDP4 CRTC with the
++ * overlay/mixer/cursor machinery removed (MDP3 has none of it).
++ */
++
++#include <drm/drm_atomic_helper.h>
++#include <drm/drm_crtc.h>
++#include <drm/drm_managed.h>
++#include <drm/drm_mode.h>
++#include <drm/drm_probe_helper.h>
++#include <drm/drm_vblank.h>
++
++#include "mdp3_kms.h"
++
++struct mdp3_crtc {
++	struct drm_crtc base;
++	bool enabled;
++
++	/* if there is a pending flip, this will be non-null: */
++	struct drm_pending_vblank_event *event;
++
++#define PENDING_FLIP   0x2
++	atomic_t pending;
++
++	struct mdp_irq vblank;
++	struct mdp_irq err;
++};
++#define to_mdp3_crtc(x) container_of(x, struct mdp3_crtc, base)
++
++static struct mdp3_kms *get_kms(struct drm_crtc *crtc)
++{
++	struct msm_drm_private *priv = crtc->dev->dev_private;
++
++	return to_mdp3_kms(to_mdp_kms(priv->kms));
++}
++
++static void request_pending(struct drm_crtc *crtc, uint32_t pending)
++{
++	struct mdp3_crtc *mdp3_crtc = to_mdp3_crtc(crtc);
++
++	atomic_or(pending, &mdp3_crtc->pending);
++	mdp_irq_register(&get_kms(crtc)->base, &mdp3_crtc->vblank);
++}
++
++static void complete_flip(struct drm_crtc *crtc)
++{
++	struct mdp3_crtc *mdp3_crtc = to_mdp3_crtc(crtc);
++	struct drm_device *dev = crtc->dev;
++	struct drm_pending_vblank_event *event;
++	unsigned long flags;
++
++	spin_lock_irqsave(&dev->event_lock, flags);
++	event = mdp3_crtc->event;
++	if (event) {
++		mdp3_crtc->event = NULL;
++		DBG("send event: %p", event);
++		drm_crtc_send_vblank_event(crtc, event);
++	}
++	spin_unlock_irqrestore(&dev->event_lock, flags);
++}
++
++/*
++ * Underflow guard. The msm8909-era downstream (msm-3.10) does NOT program
++ * any QOS remapper / watermark / panic LUT — it only raises the DMA_P bus
++ * priority via PANIC_ROBUST_CTRL=BIT(0) at scanout start. The QOS/LUT
++ * writes (and the fill-level formula) come from newer SoCs and the bad
++ * 1280-wide LUT (>16 levels) likely mis-prioritised the fetch. Match the
++ * downstream exactly.
++ */
++static void mdp3_crtc_setup_panic_lut(struct mdp3_kms *mdp3_kms,
++				      uint32_t width)
++{
++	mdp3_write(mdp3_kms, REG_MDP3_PANIC_ROBUST_CTRL, 1);
++}
++
++static void mdp3_crtc_atomic_disable(struct drm_crtc *crtc,
++				     struct drm_atomic_state *state)
++{
++	struct mdp3_crtc *mdp3_crtc = to_mdp3_crtc(crtc);
++	struct mdp3_kms *mdp3_kms = get_kms(crtc);
++	unsigned long flags;
++
++	DBG("disable");
++
++	if (WARN_ON(!mdp3_crtc->enabled))
++		return;
++
++	/* Disable/save vblank irq handling before power is disabled */
++	drm_crtc_vblank_off(crtc);
++
++	/* err irq is not registered during bring-up (see atomic_enable) */
++	mdp3_disable(mdp3_kms);
++
++	if (crtc->state->event && !crtc->state->active) {
++		WARN_ON(mdp3_crtc->event);
++		spin_lock_irqsave(&mdp3_kms->dev->event_lock, flags);
++		drm_crtc_send_vblank_event(crtc, crtc->state->event);
++		crtc->state->event = NULL;
++		spin_unlock_irqrestore(&mdp3_kms->dev->event_lock, flags);
++	}
++
++	mdp3_crtc->enabled = false;
++}
++
++static void mdp3_crtc_atomic_enable(struct drm_crtc *crtc,
++				    struct drm_atomic_state *state)
++{
++	struct mdp3_crtc *mdp3_crtc = to_mdp3_crtc(crtc);
++	struct mdp3_kms *mdp3_kms = get_kms(crtc);
++	struct drm_display_mode *mode = &crtc->state->adjusted_mode;
++
++	DBG("enable");
++
++	if (WARN_ON(mdp3_crtc->enabled))
++		return;
++
++	mdp3_enable(mdp3_kms);
++
++	mdp3_crtc_setup_panic_lut(mdp3_kms, mode->hdisplay);
++
++	/* Restore vblank irq handling after power is enabled */
++	drm_crtc_vblank_on(crtc);
++
++	/*
++	 * The underrun error IRQ is intentionally left unregistered: the
++	 * bootloader leaves the timing generator running, so until DMA_P is
++	 * feeding it the interface underflows and an enabled underrun IRQ
++	 * would storm.  The handler is diagnostic only.
++	 */
++
++	mdp3_crtc->enabled = true;
++}
++
++static int mdp3_crtc_atomic_check(struct drm_crtc *crtc,
++		struct drm_atomic_state *state)
++{
++	return 0;
++}
++
++static void mdp3_crtc_atomic_begin(struct drm_crtc *crtc,
++				   struct drm_atomic_state *state)
++{
++}
++
++static void mdp3_crtc_atomic_flush(struct drm_crtc *crtc,
++				   struct drm_atomic_state *state)
++{
++	struct mdp3_crtc *mdp3_crtc = to_mdp3_crtc(crtc);
++	struct drm_device *dev = crtc->dev;
++	unsigned long flags;
++
++	DBG("event: %p", crtc->state->event);
++
++	WARN_ON(mdp3_crtc->event);
++
++	spin_lock_irqsave(&dev->event_lock, flags);
++	mdp3_crtc->event = crtc->state->event;
++	crtc->state->event = NULL;
++	spin_unlock_irqrestore(&dev->event_lock, flags);
++
++	/*
++	 * No flush register on MDP3: the DMA_P buffer address written by
++	 * the plane latches at the next vsync.  Just wait for it.
++	 */
++	request_pending(crtc, PENDING_FLIP);
++}
++
++static const struct drm_crtc_funcs mdp3_crtc_funcs = {
++	.set_config = drm_atomic_helper_set_config,
++	.page_flip = drm_atomic_helper_page_flip,
++	.reset = drm_atomic_helper_crtc_reset,
++	.atomic_duplicate_state = drm_atomic_helper_crtc_duplicate_state,
++	.atomic_destroy_state = drm_atomic_helper_crtc_destroy_state,
++	.enable_vblank  = msm_crtc_enable_vblank,
++	.disable_vblank = msm_crtc_disable_vblank,
++};
++
++static const struct drm_crtc_helper_funcs mdp3_crtc_helper_funcs = {
++	.atomic_check = mdp3_crtc_atomic_check,
++	.atomic_begin = mdp3_crtc_atomic_begin,
++	.atomic_flush = mdp3_crtc_atomic_flush,
++	.atomic_enable = mdp3_crtc_atomic_enable,
++	.atomic_disable = mdp3_crtc_atomic_disable,
++};
++
++static void mdp3_crtc_vblank_irq(struct mdp_irq *irq, uint32_t irqstatus)
++{
++	struct mdp3_crtc *mdp3_crtc = container_of(irq, struct mdp3_crtc, vblank);
++	struct drm_crtc *crtc = &mdp3_crtc->base;
++	unsigned pending;
++
++	mdp_irq_unregister(&get_kms(crtc)->base, &mdp3_crtc->vblank);
++
++	pending = atomic_xchg(&mdp3_crtc->pending, 0);
++
++	if (pending & PENDING_FLIP)
++		complete_flip(crtc);
++}
++
++static void mdp3_crtc_err_irq(struct mdp_irq *irq, uint32_t irqstatus)
++{
++	DBG("error: %08x", irqstatus);
++}
++
++uint32_t mdp3_crtc_vblank(struct drm_crtc *crtc)
++{
++	struct mdp3_crtc *mdp3_crtc = to_mdp3_crtc(crtc);
++
++	return mdp3_crtc->vblank.irqmask;
++}
++
++void mdp3_crtc_wait_for_commit_done(struct drm_crtc *crtc)
++{
++	struct mdp3_kms *mdp3_kms = get_kms(crtc);
++
++	if (!to_mdp3_crtc(crtc)->enabled)
++		return;
++
++	/* one vsync so the latched DMA_P address is live (100ms timeout) */
++	mdp_irq_wait(&mdp3_kms->base, mdp3_crtc_vblank(crtc));
++}
++
++struct drm_crtc *mdp3_crtc_init(struct drm_device *dev,
++		struct drm_plane *plane)
++{
++	struct drm_crtc *crtc;
++	struct mdp3_crtc *mdp3_crtc;
++
++	mdp3_crtc = drmm_crtc_alloc_with_planes(dev, struct mdp3_crtc, base,
++						plane, NULL,
++						&mdp3_crtc_funcs, "DMA_P");
++	if (IS_ERR(mdp3_crtc))
++		return ERR_CAST(mdp3_crtc);
++
++	crtc = &mdp3_crtc->base;
++
++	mdp3_crtc->vblank.irqmask = MDP3_IRQ_LCDC_START_OF_FRAME;
++	mdp3_crtc->vblank.irq = mdp3_crtc_vblank_irq;
++
++	mdp3_crtc->err.irqmask = MDP3_IRQ_LCDC_UNDERFLOW;
++	mdp3_crtc->err.irq = mdp3_crtc_err_irq;
++
++	drm_crtc_helper_add(crtc, &mdp3_crtc_helper_funcs);
++
++	return crtc;
++}
+diff --git a/drivers/gpu/drm/msm/disp/mdp3/mdp3_dsi_encoder.c b/drivers/gpu/drm/msm/disp/mdp3/mdp3_dsi_encoder.c
+new file mode 100644
+index 000000000..bdf0acef9
+--- /dev/null
++++ b/drivers/gpu/drm/msm/disp/mdp3/mdp3_dsi_encoder.c
+@@ -0,0 +1,245 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * MDP3 DSI video-mode encoder = the LCDC-style timing generator at
++ * 0xf0000, modeled on mdp4_dsi_encoder (same register layout and
++ * timing formulas, different offsets).
++ */
++
++#include <linux/workqueue.h>
++
++#include <drm/drm_crtc.h>
++#include <drm/drm_managed.h>
++#include <drm/drm_probe_helper.h>
++
++#include "mdp3_kms.h"
++
++#ifdef CONFIG_DRM_MSM_DSI
++
++struct mdp3_dsi_encoder {
++	struct drm_encoder base;
++	bool enabled;
++
++	/*
++	 * HACK(atv329q): deferred work that re-arms the timing generator a
++	 * moment after enable (see mdp3_dsi_encoder_kick).
++	 */
++	struct delayed_work kick_work;
++	int kick_count;
++};
++#define to_mdp3_dsi_encoder(x) container_of(x, struct mdp3_dsi_encoder, base)
++
++static struct mdp3_kms *get_kms(struct drm_encoder *encoder)
++{
++	struct msm_drm_private *priv = encoder->dev->dev_private;
++
++	return to_mdp3_kms(to_mdp_kms(priv->kms));
++}
++
++static void mdp3_dsi_encoder_mode_set(struct drm_encoder *encoder,
++				      struct drm_display_mode *mode,
++				      struct drm_display_mode *adjusted_mode)
++{
++	struct mdp3_kms *mdp3_kms = get_kms(encoder);
++	uint32_t dsi_hsync_skew, vsync_period, vsync_len, ctrl_pol;
++	uint32_t display_v_start, display_v_end;
++	uint32_t hsync_start_x, hsync_end_x;
++
++	mode = adjusted_mode;
++
++	DBG("set mode: " DRM_MODE_FMT, DRM_MODE_ARG(mode));
++
++	/*
++	 * HACK(atv329q): on a seamless handover the LK bootloader already
++	 * programmed the timing generator for this exact mode and it is running
++	 * (the ADV7533 is locked to it).  Don't rewrite the timing registers --
++	 * just let the plane re-point the scanout.
++	 */
++	if (mdp3_kms->handover)
++		return;
++
++	ctrl_pol = 0;
++	if (mode->flags & DRM_MODE_FLAG_NHSYNC)
++		ctrl_pol |= BIT(0);
++	if (mode->flags & DRM_MODE_FLAG_NVSYNC)
++		ctrl_pol |= BIT(1);
++
++	dsi_hsync_skew = 0;
++
++	hsync_start_x = (mode->htotal - mode->hsync_start);
++	hsync_end_x = mode->htotal - (mode->hsync_start - mode->hdisplay) - 1;
++
++	vsync_period = mode->vtotal * mode->htotal;
++	vsync_len = (mode->vsync_end - mode->vsync_start) * mode->htotal;
++	display_v_start = (mode->vtotal - mode->vsync_start) * mode->htotal
++		+ dsi_hsync_skew;
++	display_v_end = vsync_period
++		- ((mode->vsync_start - mode->vdisplay) * mode->htotal)
++		+ dsi_hsync_skew - 1;
++
++	mdp3_write(mdp3_kms, REG_MDP3_DSI_VIDEO_HSYNC_CTL,
++		   (mode->htotal << 16) |
++		   (mode->hsync_end - mode->hsync_start));
++	mdp3_write(mdp3_kms, REG_MDP3_DSI_VIDEO_VSYNC_PERIOD, vsync_period);
++	mdp3_write(mdp3_kms, REG_MDP3_DSI_VIDEO_VSYNC_PULSE_WIDTH, vsync_len);
++	mdp3_write(mdp3_kms, REG_MDP3_DSI_VIDEO_DISPLAY_HCTL,
++		   (hsync_end_x << 16) | hsync_start_x);
++	mdp3_write(mdp3_kms, REG_MDP3_DSI_VIDEO_DISPLAY_V_START,
++		   display_v_start);
++	mdp3_write(mdp3_kms, REG_MDP3_DSI_VIDEO_DISPLAY_V_END, display_v_end);
++
++	/* active area == display area */
++	mdp3_write(mdp3_kms, REG_MDP3_DSI_VIDEO_ACTIVE_HCTL, 0);
++	mdp3_write(mdp3_kms, REG_MDP3_DSI_VIDEO_ACTIVE_V_START, 0);
++	mdp3_write(mdp3_kms, REG_MDP3_DSI_VIDEO_ACTIVE_V_END, 0);
++
++	mdp3_write(mdp3_kms, REG_MDP3_DSI_VIDEO_BORDER_CLR, 0);
++	mdp3_write(mdp3_kms, REG_MDP3_DSI_VIDEO_HSYNC_SKEW, dsi_hsync_skew);
++	mdp3_write(mdp3_kms, REG_MDP3_DSI_VIDEO_CTL_POLARITY, ctrl_pol);
++	mdp3_write(mdp3_kms, REG_MDP3_DSI_VIDEO_TEST_CTL, 0x70000000);
++
++	/* enable underflow recovery (bit31) with black fill, like downstream */
++	mdp3_write(mdp3_kms, REG_MDP3_DSI_VIDEO_UNDERFLOW_CTL, 0x80000000);
++}
++
++/*
++ * HACK(atv329q): re-arm the MDP3 timing generator AFTER the DSI host video
++ * engine is streaming.  DRM runs the MDP3 encoder enable (which starts the
++ * TG) BEFORE drm_atomic_bridge_chain_enable (which starts the DSI host video
++ * engine), so the TG is started while the host is not yet feeding it -> the
++ * TG and the host are desynced, the ADV7533 never locks onto the link and the
++ * screen stays black.  Validated on silicon: re-toggling VIDEO_EN (TEST_CTL
++ * cleared, DMA_P re-kicked) a moment after boot lights the panel.
++ *
++ * There is no clean "after the whole modeset" encoder hook, so do it from a
++ * delayed work scheduled at enable.  Repeat a few times because the moment
++ * the host/PHY/ADV7533 are settled enough varies boot to boot.
++ */
++static void mdp3_dsi_encoder_kick(struct work_struct *work)
++{
++	struct mdp3_dsi_encoder *mdp3_dsi_encoder =
++		container_of(work, struct mdp3_dsi_encoder, kick_work.work);
++	struct drm_encoder *encoder = &mdp3_dsi_encoder->base;
++	struct mdp3_kms *mdp3_kms = get_kms(encoder);
++
++	if (!mdp3_dsi_encoder->enabled)
++		return;
++
++	/* re-arm the TG, in sync with the now-running DSI host video engine */
++	mdp3_write(mdp3_kms, REG_MDP3_DSI_VIDEO_TEST_CTL, 0);
++	mdp3_write(mdp3_kms, REG_MDP3_DMA_P_START, 1);
++	mdp3_write(mdp3_kms, REG_MDP3_DSI_VIDEO_EN, 0);
++	mdp3_write(mdp3_kms, REG_MDP3_DSI_VIDEO_EN, 1);
++	mdp3_write(mdp3_kms, REG_MDP3_DMA_P_START, 1);
++
++	/*
++	 * The ADV7533 lock after a re-kick is somewhat probabilistic (analog
++	 * PLL + a continuous MDP3 underflow), so retry over a wide window to
++	 * reliably catch a boot where it locks.  ~12 attempts over ~8s.
++	 */
++	if (++mdp3_dsi_encoder->kick_count < 12)
++		schedule_delayed_work(&mdp3_dsi_encoder->kick_work,
++				      msecs_to_jiffies(700));
++}
++
++static void mdp3_dsi_encoder_disable(struct drm_encoder *encoder)
++{
++	struct mdp3_dsi_encoder *mdp3_dsi_encoder = to_mdp3_dsi_encoder(encoder);
++	struct mdp3_kms *mdp3_kms = get_kms(encoder);
++
++	if (!mdp3_dsi_encoder->enabled)
++		return;
++
++	/*
++	 * handover is over once we tear the pipeline down; a later re-enable
++	 * must do a full (non-handover) bring-up.  Release the persistent
++	 * clocks/genpd ref that mdp3_kms_init() held to keep LK's running TG fed
++	 * (the per-commit enable_commit ref still covers this teardown commit).
++	 */
++	if (mdp3_kms->handover) {
++		mdp3_disable(mdp3_kms);
++		pm_runtime_put_sync(mdp3_kms->dev->dev);
++	}
++	mdp3_kms->handover = false;
++
++	/* stop the re-kick work (it bails out once enabled is cleared) */
++	mdp3_dsi_encoder->enabled = false;
++	cancel_delayed_work_sync(&mdp3_dsi_encoder->kick_work);
++
++	mdp3_write(mdp3_kms, REG_MDP3_DSI_VIDEO_EN, 0);
++
++	/*
++	 * Wait for a vsync so we know the disable latched before the
++	 * source of the vsyncs (the DSI host) gets shut down.
++	 */
++	mdp_irq_wait(&mdp3_kms->base, MDP3_IRQ_LCDC_START_OF_FRAME);
++}
++
++static void mdp3_dsi_encoder_enable(struct drm_encoder *encoder)
++{
++	struct mdp3_dsi_encoder *mdp3_dsi_encoder = to_mdp3_dsi_encoder(encoder);
++	struct mdp3_kms *mdp3_kms = get_kms(encoder);
++
++	if (mdp3_dsi_encoder->enabled)
++		return;
++
++	/*
++	 * HACK(atv329q): seamless handover -- the LK timing generator is already
++	 * running and the ADV7533 is locked to it.  Don't touch VIDEO_EN (a
++	 * stop/start would drop the inherited lock); the plane already re-pointed
++	 * DMA_P at the kernel framebuffer and the running TG refetches it.
++	 * One-shot: clear the flag so a later disable/enable does a real enable.
++	 */
++	if (mdp3_kms->handover) {
++		/* keep handover set through this whole first modeset (the plane
++		 * needs it too); it is cleared on disable. */
++		mdp3_dsi_encoder->enabled = true;
++		return;
++	}
++
++	/* start the video-mode timing generator */
++	mdp3_write(mdp3_kms, REG_MDP3_DSI_VIDEO_EN, 1);
++
++	/*
++	 * Kick DMA_P once to start the fetch (as the LK bootloader does in
++	 * video mode); the continuous re-fetch is then driven by the TG.
++	 */
++	mdp3_write(mdp3_kms, REG_MDP3_DMA_P_START, 1);
++
++	mdp3_dsi_encoder->enabled = true;
++
++	/*
++	 * HACK(atv329q): re-arm the TG repeatedly.  The ADV7533 lock is probabilistic
++	 * per VIDEO_EN attempt but STICKY once achieved, so more attempts =
++	 * cumulatively higher success (measured: 1x ~1/5, 12x ~2/3).  Push the count
++	 * up to converge toward reliable.  (single-shot and single-shot+VIDEO_DONE
++	 * poll were both worse, ~1/6 -- the retries are what help.)
++	 */
++	mdp3_dsi_encoder->kick_count = 0;
++	schedule_delayed_work(&mdp3_dsi_encoder->kick_work,
++			      msecs_to_jiffies(700));
++}
++
++static const struct drm_encoder_helper_funcs mdp3_dsi_encoder_helper_funcs = {
++	.mode_set = mdp3_dsi_encoder_mode_set,
++	.disable = mdp3_dsi_encoder_disable,
++	.enable = mdp3_dsi_encoder_enable,
++};
++
++struct drm_encoder *mdp3_dsi_encoder_init(struct drm_device *dev)
++{
++	struct mdp3_dsi_encoder *mdp3_dsi_encoder;
++
++	mdp3_dsi_encoder = drmm_encoder_alloc(dev, struct mdp3_dsi_encoder,
++					      base, NULL,
++					      DRM_MODE_ENCODER_DSI, NULL);
++	if (IS_ERR(mdp3_dsi_encoder))
++		return ERR_CAST(mdp3_dsi_encoder);
++
++	INIT_DELAYED_WORK(&mdp3_dsi_encoder->kick_work, mdp3_dsi_encoder_kick);
++
++	drm_encoder_helper_add(&mdp3_dsi_encoder->base,
++			       &mdp3_dsi_encoder_helper_funcs);
++
++	return &mdp3_dsi_encoder->base;
++}
++#endif /* CONFIG_DRM_MSM_DSI */
+diff --git a/drivers/gpu/drm/msm/disp/mdp3/mdp3_hw.h b/drivers/gpu/drm/msm/disp/mdp3/mdp3_hw.h
+new file mode 100644
+index 000000000..1d0721c0c
+--- /dev/null
++++ b/drivers/gpu/drm/msm/disp/mdp3/mdp3_hw.h
+@@ -0,0 +1,96 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * MDP3 register map (MSM8909 and similar single-pipe display controllers).
++ *
++ * Offsets are relative to the "mdp_phys" region (0x01a00000 on msm8909).
++ * Cross-checked against the downstream MDP3 driver (mdp3_hwio.h /
++ * mdp3_dma.c, msm-3.10) and the LK bootloader bring-up for this SoC.
++ */
++
++#ifndef __MDP3_HW_H__
++#define __MDP3_HW_H__
++
++/* global */
++#define REG_MDP3_INTR_ENABLE			0x00020
++#define REG_MDP3_INTR_STATUS			0x00024
++#define REG_MDP3_INTR_CLEAR			0x00028
++#define REG_MDP3_DISPLAY_STATUS			0x00038
++#define REG_MDP3_DMA_P_START			0x00044
++#define REG_MDP3_DMA_S_START			0x00048
++#define REG_MDP3_HW_VERSION			0x00070
++#define REG_MDP3_SW_RESET			0x00074
++#define REG_MDP3_CGC_EN				0x00100
++#define REG_MDP3_SYNC_CONFIG_0			0x00300
++#define REG_MDP3_AUTOREFRESH_CONFIG_P		0x0034c
++
++/* primary scanout DMA engine */
++#define REG_MDP3_DMA_P_CONFIG			0x90000
++#define REG_MDP3_DMA_P_SIZE			0x90004
++#define REG_MDP3_DMA_P_IBUF_ADDR		0x90008
++#define REG_MDP3_DMA_P_IBUF_Y_STRIDE		0x9000c
++#define REG_MDP3_DMA_P_OUT_XY			0x90010
++#define REG_MDP3_DMA_P_FETCH_CFG		0x90074
++#define REG_MDP3_DMA_P_QOS_REMAPPER		0x90090
++#define REG_MDP3_DMA_P_WATERMARK_0		0x90094
++#define REG_MDP3_DMA_P_WATERMARK_1		0x90098
++#define REG_MDP3_DMA_P_WATERMARK_2		0x9009c
++#define REG_MDP3_PANIC_ROBUST_CTRL		0x900a0
++#define REG_MDP3_PANIC_LUT0			0x900a4
++#define REG_MDP3_PANIC_LUT1			0x900a8
++#define REG_MDP3_ROBUST_LUT			0x900ac
++
++/*
++ * DMA_P_CONFIG fields (downstream mdp3_dmap_config()):
++ *   [5:0]   component output depths (0x3f = 8 bits each)
++ *   [7]     pack align MSB
++ *   [13:8]  pack pattern (RGB = 0x21, BGR = 0x12)
++ *   [14]    color components flip
++ *   [18]    bit mask polarity
++ *   [20:19] output select (0 = AHB, 1 = DSI cmd, 2 = LCDC, 3 = DSI video)
++ *   [24]    dither enable
++ *   [26:25] input buffer format (0 = RGB888, 1 = RGB565, 2 = XRGB8888)
++ *
++ * Values below are for DSI video output (out_sel = 3), as programmed by
++ * the downstream driver.  Note the LK bootloader instead uses 0x001800bf
++ * (pack pattern 0, pack align MSB) for its RGB888 splash on this very
++ * board — if colors come out swapped, that is the knob.
++ */
++#define MDP3_DMA_P_CONFIG_DSI_VIDEO_RGB888	0x0018213f
++#define MDP3_DMA_P_CONFIG_DSI_VIDEO_XRGB8888	0x0418213f
++
++/* downstream programs this fixed fetch config */
++#define MDP3_DMA_P_FETCH_CFG_DEFAULT		0x40
++
++/* DSI video-mode timing generator (LCDC-style TG at 0xf0000) */
++#define REG_MDP3_DSI_VIDEO_EN			0xf0000
++#define REG_MDP3_DSI_VIDEO_HSYNC_CTL		0xf0004
++#define REG_MDP3_DSI_VIDEO_VSYNC_PERIOD		0xf0008
++#define REG_MDP3_DSI_VIDEO_VSYNC_PULSE_WIDTH	0xf000c
++#define REG_MDP3_DSI_VIDEO_DISPLAY_HCTL		0xf0010
++#define REG_MDP3_DSI_VIDEO_DISPLAY_V_START	0xf0014
++#define REG_MDP3_DSI_VIDEO_DISPLAY_V_END	0xf0018
++#define REG_MDP3_DSI_VIDEO_ACTIVE_HCTL		0xf001c
++#define REG_MDP3_DSI_VIDEO_ACTIVE_V_START	0xf0020
++#define REG_MDP3_DSI_VIDEO_ACTIVE_V_END		0xf0024
++#define REG_MDP3_DSI_VIDEO_BORDER_CLR		0xf0028
++#define REG_MDP3_DSI_VIDEO_UNDERFLOW_CTL	0xf002c
++#define REG_MDP3_DSI_VIDEO_HSYNC_SKEW		0xf0030
++#define REG_MDP3_DSI_VIDEO_TEST_CTL		0xf0034
++#define REG_MDP3_DSI_VIDEO_CTL_POLARITY		0xf0038
++
++/* DSI command-mode (unused, video-mode only for now) */
++#define REG_MDP3_DSI_CMD_MODE_ID_MAP		0xf1000
++#define REG_MDP3_DSI_CMD_MODE_TRIGGER_EN	0xf1004
++
++/*
++ * INTR bits (downstream mdp3_hwio.h).  The DSI video-mode timing
++ * generator reuses the legacy "LCDC" interrupt lines for the primary
++ * interface: vsync = LCDC_START_OF_FRAME, underrun = LCDC_UNDERFLOW.
++ */
++#define MDP3_IRQ_DMA_P_DONE			BIT(14)
++#define MDP3_IRQ_LCDC_START_OF_FRAME		BIT(15)
++#define MDP3_IRQ_LCDC_UNDERFLOW			BIT(16)
++
++#define MDP3_IRQ_ALL				0x0fffffff
++
++#endif /* __MDP3_HW_H__ */
+diff --git a/drivers/gpu/drm/msm/disp/mdp3/mdp3_irq.c b/drivers/gpu/drm/msm/disp/mdp3/mdp3_irq.c
+new file mode 100644
+index 000000000..4687ee351
+--- /dev/null
++++ b/drivers/gpu/drm/msm/disp/mdp3/mdp3_irq.c
+@@ -0,0 +1,106 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * MDP3 interrupt handling, modeled on MDP4.
++ */
++
++#include <drm/drm_print.h>
++#include <drm/drm_vblank.h>
++
++#include "msm_drv.h"
++#include "mdp3_kms.h"
++
++void mdp3_set_irqmask(struct mdp_kms *mdp_kms, uint32_t irqmask,
++		uint32_t old_irqmask)
++{
++	mdp3_write(to_mdp3_kms(mdp_kms), REG_MDP3_INTR_CLEAR,
++		irqmask ^ (irqmask & old_irqmask));
++	mdp3_write(to_mdp3_kms(mdp_kms), REG_MDP3_INTR_ENABLE, irqmask);
++}
++
++static void mdp3_irq_error_handler(struct mdp_irq *irq, uint32_t irqstatus)
++{
++	DRM_ERROR_RATELIMITED("errors: %08x\n", irqstatus);
++}
++
++void mdp3_irq_preinstall(struct msm_kms *kms)
++{
++	struct mdp3_kms *mdp3_kms = to_mdp3_kms(to_mdp_kms(kms));
++
++	pm_runtime_get_sync(mdp3_kms->dev->dev);
++	mdp3_enable(mdp3_kms);
++	mdp3_write(mdp3_kms, REG_MDP3_INTR_CLEAR, MDP3_IRQ_ALL);
++	mdp3_write(mdp3_kms, REG_MDP3_INTR_ENABLE, 0);
++	mdp3_disable(mdp3_kms);
++	pm_runtime_put_sync(mdp3_kms->dev->dev);
++}
++
++int mdp3_irq_postinstall(struct msm_kms *kms)
++{
++	/*
++	 * Deliberately nothing here.  INTR_ENABLE must stay 0 while the
++	 * display is off: with the MDSS GDSC and clocks down, any MDP3
++	 * interrupt would make the handler read registers on a dead AHB
++	 * segment and hang the bus.  The underrun error irq is registered
++	 * by the CRTC at atomic_enable time instead, when the DSI host
++	 * holds the GDSC and AHB clock for the whole scanout lifetime.
++	 */
++	return 0;
++}
++
++void mdp3_irq_uninstall(struct msm_kms *kms)
++{
++	struct mdp3_kms *mdp3_kms = to_mdp3_kms(to_mdp_kms(kms));
++
++	pm_runtime_get_sync(mdp3_kms->dev->dev);
++	mdp3_enable(mdp3_kms);
++	mdp3_write(mdp3_kms, REG_MDP3_INTR_ENABLE, 0);
++	mdp3_disable(mdp3_kms);
++	pm_runtime_put_sync(mdp3_kms->dev->dev);
++}
++
++irqreturn_t mdp3_irq(struct msm_kms *kms)
++{
++	struct mdp_kms *mdp_kms = to_mdp_kms(kms);
++	struct mdp3_kms *mdp3_kms = to_mdp3_kms(mdp_kms);
++	struct drm_device *dev = mdp3_kms->dev;
++	struct drm_crtc *crtc;
++	uint32_t status, enable;
++
++	enable = mdp3_read(mdp3_kms, REG_MDP3_INTR_ENABLE);
++	status = mdp3_read(mdp3_kms, REG_MDP3_INTR_STATUS) & enable;
++	mdp3_write(mdp3_kms, REG_MDP3_INTR_CLEAR, status);
++
++	VERB("status=%08x", status);
++
++	if (!status)
++		return IRQ_NONE;
++
++	mdp_dispatch_irqs(mdp_kms, status);
++
++	drm_for_each_crtc(crtc, dev)
++		if (status & mdp3_crtc_vblank(crtc))
++			drm_crtc_handle_vblank(crtc);
++
++	return IRQ_HANDLED;
++}
++
++/*
++ * Called by the drm_vblank core under vbl_lock (spinlock, irqs off):
++ * absolutely no sleeping (no runtime PM, no clk_prepare_enable) here.
++ * Safe regardless: vblank is only (un)armed while the CRTC is active,
++ * and an active display means the DSI host holds the MDSS GDSC and
++ * AHB clock, so the register access cannot bus-hang.
++ */
++int mdp3_enable_vblank(struct msm_kms *kms, struct drm_crtc *crtc)
++{
++	mdp_update_vblank_mask(to_mdp_kms(kms),
++			mdp3_crtc_vblank(crtc), true);
++
++	return 0;
++}
++
++void mdp3_disable_vblank(struct msm_kms *kms, struct drm_crtc *crtc)
++{
++	mdp_update_vblank_mask(to_mdp_kms(kms),
++			mdp3_crtc_vblank(crtc), false);
++}
+diff --git a/drivers/gpu/drm/msm/disp/mdp3/mdp3_kms.c b/drivers/gpu/drm/msm/disp/mdp3/mdp3_kms.c
+new file mode 100644
+index 000000000..023c1809e
+--- /dev/null
++++ b/drivers/gpu/drm/msm/disp/mdp3/mdp3_kms.c
+@@ -0,0 +1,431 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * MDP3 KMS driver (MSM8909), modeled on MDP4.
++ *
++ * The MDP3 is a single-pipe display controller: one scanout DMA engine
++ * (DMA_P) feeding one video-mode timing generator (DSI).  No layer
++ * mixers, no overlays, no IOMMU (scanout fetches from physical
++ * addresses, hence kms->vm stays NULL and GEM falls back to contiguous
++ * CMA allocations).
++ */
++
++#include <linux/clk.h>
++#include <linux/delay.h>
++
++#include <drm/drm_vblank.h>
++
++#include "msm_drv.h"
++#include "msm_gem.h"
++#include "mdp3_kms.h"
++
++static int mdp3_hw_init(struct msm_kms *kms)
++{
++	struct mdp3_kms *mdp3_kms = to_mdp3_kms(to_mdp_kms(kms));
++	struct drm_device *dev = mdp3_kms->dev;
++
++	/* GDSC *and* AHB clock both required, or register access bus-hangs */
++	pm_runtime_get_sync(dev->dev);
++	mdp3_enable(mdp3_kms);
++
++	/* the LK bootloader programs this for DSI auto clock gating */
++	mdp3_write(mdp3_kms, REG_MDP3_CGC_EN, 0x3fbff);
++
++	/* clear any pending interrupt before the irq line is live */
++	mdp3_write(mdp3_kms, REG_MDP3_INTR_ENABLE, 0);
++	mdp3_write(mdp3_kms, REG_MDP3_INTR_CLEAR, MDP3_IRQ_ALL);
++
++	mdp3_disable(mdp3_kms);
++	pm_runtime_put_sync(dev->dev);
++
++	return 0;
++}
++
++/*
++ * Every register access needs the MDSS GDSC up, or the AHB bus hangs
++ * (hard freeze).  Unlike MDP4 this hardware sits behind a genpd, so
++ * bracket commits with runtime PM in addition to the clocks.
++ */
++static void mdp3_enable_commit(struct msm_kms *kms)
++{
++	struct mdp3_kms *mdp3_kms = to_mdp3_kms(to_mdp_kms(kms));
++
++	pm_runtime_get_sync(mdp3_kms->dev->dev);
++	mdp3_enable(mdp3_kms);
++}
++
++static void mdp3_disable_commit(struct msm_kms *kms)
++{
++	struct mdp3_kms *mdp3_kms = to_mdp3_kms(to_mdp_kms(kms));
++
++	mdp3_disable(mdp3_kms);
++	pm_runtime_put_sync(mdp3_kms->dev->dev);
++}
++
++static void mdp3_flush_commit(struct msm_kms *kms, unsigned crtc_mask)
++{
++	/* no flush register on MDP3: DMA_P registers latch at vsync */
++}
++
++static void mdp3_wait_flush(struct msm_kms *kms, unsigned crtc_mask)
++{
++	struct mdp3_kms *mdp3_kms = to_mdp3_kms(to_mdp_kms(kms));
++	struct drm_crtc *crtc;
++
++	for_each_crtc_mask(mdp3_kms->dev, crtc, crtc_mask)
++		mdp3_crtc_wait_for_commit_done(crtc);
++}
++
++static void mdp3_complete_commit(struct msm_kms *kms, unsigned crtc_mask)
++{
++}
++
++static long mdp3_round_pixclk(struct msm_kms *kms, unsigned long rate,
++		struct drm_encoder *encoder)
++{
++	/* single DSI encoder; the DSI PHY PLL generates the pixel clock */
++	return rate;
++}
++
++static void mdp3_destroy(struct msm_kms *kms)
++{
++	struct mdp3_kms *mdp3_kms = to_mdp3_kms(to_mdp_kms(kms));
++	struct device *dev = mdp3_kms->dev->dev;
++
++	if (mdp3_kms->rpm_enabled)
++		pm_runtime_disable(dev);
++
++	mdp_kms_destroy(&mdp3_kms->base);
++}
++
++static const struct mdp_kms_funcs kms_funcs = {
++	.base = {
++		.hw_init         = mdp3_hw_init,
++		.irq_preinstall  = mdp3_irq_preinstall,
++		.irq_postinstall = mdp3_irq_postinstall,
++		.irq_uninstall   = mdp3_irq_uninstall,
++		.irq             = mdp3_irq,
++		.enable_vblank   = mdp3_enable_vblank,
++		.disable_vblank  = mdp3_disable_vblank,
++		.enable_commit   = mdp3_enable_commit,
++		.disable_commit  = mdp3_disable_commit,
++		.flush_commit    = mdp3_flush_commit,
++		.wait_flush      = mdp3_wait_flush,
++		.complete_commit = mdp3_complete_commit,
++		.round_pixclk    = mdp3_round_pixclk,
++		.destroy         = mdp3_destroy,
++	},
++	.set_irqmask         = mdp3_set_irqmask,
++};
++
++int mdp3_disable(struct mdp3_kms *mdp3_kms)
++{
++	DBG("");
++
++	clk_disable_unprepare(mdp3_kms->core_clk);
++	clk_disable_unprepare(mdp3_kms->iface_clk);
++	clk_disable_unprepare(mdp3_kms->bus_clk);
++	clk_disable_unprepare(mdp3_kms->vsync_clk);
++
++	return 0;
++}
++
++int mdp3_enable(struct mdp3_kms *mdp3_kms)
++{
++	DBG("");
++
++	clk_prepare_enable(mdp3_kms->core_clk);
++	clk_prepare_enable(mdp3_kms->iface_clk);
++	clk_prepare_enable(mdp3_kms->bus_clk);
++	clk_prepare_enable(mdp3_kms->vsync_clk);
++
++	return 0;
++}
++
++static int modeset_init(struct mdp3_kms *mdp3_kms)
++{
++	struct drm_device *dev = mdp3_kms->dev;
++	struct msm_drm_private *priv = dev->dev_private;
++	struct drm_plane *plane;
++	struct drm_crtc *crtc;
++	struct drm_encoder *encoder;
++	int ret;
++
++	plane = mdp3_plane_init(dev);
++	if (IS_ERR(plane)) {
++		DRM_DEV_ERROR(dev->dev, "failed to construct DMA_P plane\n");
++		return PTR_ERR(plane);
++	}
++
++	crtc = mdp3_crtc_init(dev, plane);
++	if (IS_ERR(crtc)) {
++		DRM_DEV_ERROR(dev->dev, "failed to construct DMA_P crtc\n");
++		return PTR_ERR(crtc);
++	}
++
++	if (!priv->kms->dsi[0]) {
++		DRM_DEV_INFO(dev->dev, "no DSI host, display chain incomplete\n");
++		return 0;
++	}
++
++	encoder = mdp3_dsi_encoder_init(dev);
++	if (IS_ERR(encoder)) {
++		ret = PTR_ERR(encoder);
++		DRM_DEV_ERROR(dev->dev,
++			"failed to construct DSI encoder: %d\n", ret);
++		return ret;
++	}
++
++	encoder->possible_crtcs = drm_crtc_mask(crtc);
++
++	ret = msm_dsi_modeset_init(priv->kms->dsi[0], dev, encoder);
++	if (ret) {
++		DRM_DEV_ERROR(dev->dev, "failed to initialize DSI: %d\n", ret);
++		return ret;
++	}
++
++	return 0;
++}
++
++static int mdp3_kms_init(struct drm_device *dev)
++{
++	struct msm_drm_private *priv = dev->dev_private;
++	struct mdp3_kms *mdp3_kms = to_mdp3_kms(to_mdp_kms(priv->kms));
++	struct msm_kms *kms = NULL;
++	u32 version;
++	int ret;
++
++	ret = mdp_kms_init(&mdp3_kms->base, &kms_funcs);
++	if (ret) {
++		DRM_DEV_ERROR(dev->dev, "failed to init kms\n");
++		goto fail;
++	}
++
++	kms = priv->kms;
++
++	mdp3_kms->dev = dev;
++
++	/*
++	 * MDP core clock: the downstream driver runs 720p at the MAX rate
++	 * (307.2 MHz), not SVS (150 MHz) — too slow a core clock starves
++	 * the DMA_P fetch and the DSI-video interface underflows. Bump the
++	 * bus (AXI) clock too so the scanout bandwidth (~660 MB/s for
++	 * 1280x720x4@60) is sustained.
++	 *
++	 * TEST(atv329q): on the lk2nd handover these clocks are ALREADY running
++	 * (lk2nd's TG is live and the screen is up).  Re-rating a live vsync/core
++	 * clock mid-scanout may stop the inherited TG (black, no SOF).  Defer the
++	 * rate setup to the non-handover branch below; keep lk2nd's rates as-is.
++	 */
++
++	/*
++	 * HACK(atv329q) §13.7: vote scanout bandwidth on the MASTER_MDP_PORT0 ->
++	 * SLAVE_EBI_CH0 interconnect path (RPM-managed NoC/BIMC).  Core (307 MHz)
++	 * and AXI (200 MHz) are already maxed, but without an icc bandwidth
++	 * request the NoC/BIMC -> DRAM path stays at the bootloader default and
++	 * the MDP3 DMA_P fetch is starved -> continuous LCDC_UNDERFLOW -> black
++	 * (the LK handover hits this hardest).  ~664 MB/s matches the LK
++	 * bus-scaling ib for 1280x720.  Non-fatal: if the icc provider is absent
++	 * we just keep the old (underflowing) behaviour.
++	 */
++	mdp3_kms->mdp_icc = of_icc_get(dev->dev, "mdp0-mem");
++	if (IS_ERR(mdp3_kms->mdp_icc)) {
++		DRM_DEV_INFO(dev->dev, "no mdp0-mem interconnect: %ld\n",
++			     PTR_ERR(mdp3_kms->mdp_icc));
++		mdp3_kms->mdp_icc = NULL;
++	} else {
++		icc_set_bw(mdp3_kms->mdp_icc, MBps_to_icc(664),
++			   MBps_to_icc(664));
++		DRM_DEV_INFO(dev->dev, "mdp0-mem interconnect: voted 664 MB/s\n");
++	}
++
++	DBG("clocks: core=%lu bus=%lu vsync=%lu iface=%lu",
++	    clk_get_rate(mdp3_kms->core_clk),
++	    clk_get_rate(mdp3_kms->bus_clk),
++	    clk_get_rate(mdp3_kms->vsync_clk),
++	    clk_get_rate(mdp3_kms->iface_clk));
++
++	pm_runtime_enable(dev->dev);
++	mdp3_kms->rpm_enabled = true;
++
++	/*
++	 * HACK(atv329q): if the LK bootloader left the DSI-video timing
++	 * generator running (VIDEO_EN=1, screen up and the ADV7533 forwarding),
++	 * do NOT tear it down.  Keeping the pipeline alive lets the first
++	 * modeset just re-point the DMA_P scanout at the kernel framebuffer
++	 * (seamless handover); tearing it down here and restarting it later is
++	 * non-deterministic and flakily leaves the screen black.
++	 *
++	 * Otherwise, make sure things are off before going further (the
++	 * bootloader could have left the splash screen scanning out).
++	 */
++	pm_runtime_get_sync(dev->dev);
++	mdp3_enable(mdp3_kms);
++	version = mdp3_read(mdp3_kms, REG_MDP3_HW_VERSION);
++	mdp3_kms->handover = mdp3_read(mdp3_kms, REG_MDP3_DSI_VIDEO_EN) & 1;
++	/* expose the handover to the DSI manager so it adopts lk2nd's running
++	 * PHY/host instead of resetting it (HACK atv329q) */
++	/*
++	 * TEST(atv329q): force the kernel's OWN clean bring-up (handover abandoned;
++	 * the kernel cannot keep lk2nd's TG alive).  Tear down lk2nd's TG and do a
++	 * full bring-up with the TG re-kick.  Revert to adopt lk2nd's value once a
++	 * direct-from-aboot (no lk2nd) boot is the deployment path.
++	 */
++	mdp3_kms->handover = false;
++	mdp3_kms->base.base.lk_handover = mdp3_kms->handover;
++	/*
++	 * HACK(atv329q) ÉTAPE 1: defer the DSI video stream so the ADV7533 bridge
++	 * configures + arms the chip (verbatim lk2nd sequence) before the stream
++	 * starts -- lk2nd's deterministic ordering.  Only meaningful on the clean
++	 * bring-up (the handover path returns earlier in dsi_mgr_bridge_enable).
++	 */
++	mdp3_kms->base.base.lk_seq = true;
++	if (!mdp3_kms->handover) {
++		/* not a handover: safe to set the scanout clock rates now */
++		clk_set_rate(mdp3_kms->core_clk, 307200000);
++		clk_set_rate(mdp3_kms->bus_clk, 200000000);
++		clk_set_rate(mdp3_kms->vsync_clk, 19200000);
++		mdp3_write(mdp3_kms, REG_MDP3_DSI_VIDEO_EN, 0);
++		mdp3_write(mdp3_kms, REG_MDP3_INTR_ENABLE, 0);
++		mdp3_write(mdp3_kms, REG_MDP3_INTR_CLEAR, MDP3_IRQ_ALL);
++		mdp3_disable(mdp3_kms);
++		pm_runtime_put_sync(dev->dev);
++		mdelay(16);
++	}
++	/*
++	 * HACK(atv329q): on the seamless handover, do NOT drop the clocks/genpd
++	 * here.  mdp3 has NO runtime_resume callback (mdp3_pm_ops = prepare/
++	 * complete only): the core/bus clocks are managed manually by
++	 * mdp3_enable()/mdp3_disable(), and runtime PM only gates the MDSS genpd.
++	 * If we mdp3_disable() + pm_runtime_put_sync() now, the device
++	 * autosuspends (genpd off + clocks off) while LK's timing generator is
++	 * still scanning out (VIDEO_EN=1) -> the DMA_P fetch is starved ->
++	 * CONTINUOUS LCDC_UNDERFLOW -> black.  (Confirmed on silicon:
++	 * runtime_status=suspended and INTR bit16 re-fires immediately after a
++	 * clear.)  So keep the get_sync()+mdp3_enable() refs from above held for
++	 * the whole handover; they are released in mdp3_dsi_encoder_disable().
++	 */
++
++	DRM_DEV_INFO(dev->dev, "MDP3 version %08x%s\n", version,
++		     mdp3_kms->handover ? " (LK handover: keeping display up)" : "");
++
++	/*
++	 * No display IOMMU on MDP3: leave kms->vm NULL.  msm_gem then
++	 * allocates physically contiguous buffers and hands out physical
++	 * addresses as iovas.
++	 */
++
++	ret = modeset_init(mdp3_kms);
++	if (ret) {
++		DRM_DEV_ERROR(dev->dev, "modeset_init failed: %d\n", ret);
++		goto fail;
++	}
++
++	dev->mode_config.min_width = 0;
++	dev->mode_config.min_height = 0;
++	dev->mode_config.max_width = 2048;
++	dev->mode_config.max_height = 2048;
++
++	return 0;
++
++fail:
++	if (kms)
++		mdp3_destroy(kms);
++
++	return ret;
++}
++
++static const struct dev_pm_ops mdp3_pm_ops = {
++	.prepare = msm_kms_pm_prepare,
++	.complete = msm_kms_pm_complete,
++};
++
++/*
++ * Bring-up aid: boot with msm.mdp3_block_bind=1 to keep the probe
++ * deferred, get an SSH shell, then trigger the bind manually with the
++ * sysfs bind knob while watching dmesg live:
++ *   echo N > /sys/module/msm/parameters/mdp3_block_bind
++ *   echo 1a00000.display-controller > /sys/bus/platform/drivers/mdp3/bind
++ */
++static bool mdp3_block_bind;
++MODULE_PARM_DESC(mdp3_block_bind, "Defer MDP3 probe until cleared (bring-up debug)");
++module_param(mdp3_block_bind, bool, 0644);
++
++static int mdp3_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct mdp3_kms *mdp3_kms;
++	int irq;
++
++	if (mdp3_block_bind) {
++		dev_info(dev, "mdp3_block_bind set, deferring probe\n");
++		return -EPROBE_DEFER;
++	}
++
++	mdp3_kms = devm_kzalloc(dev, sizeof(*mdp3_kms), GFP_KERNEL);
++	if (!mdp3_kms)
++		return -ENOMEM;
++
++	mdp3_kms->mmio = msm_ioremap(pdev, "mdp_phys");
++	if (IS_ERR(mdp3_kms->mmio))
++		return PTR_ERR(mdp3_kms->mmio);
++
++	irq = platform_get_irq(pdev, 0);
++	if (irq < 0)
++		return dev_err_probe(dev, irq, "failed to get irq\n");
++
++	mdp3_kms->base.base.irq = irq;
++
++	mdp3_kms->core_clk = devm_clk_get(dev, "core");
++	if (IS_ERR(mdp3_kms->core_clk))
++		return dev_err_probe(dev, PTR_ERR(mdp3_kms->core_clk),
++				     "failed to get core clock\n");
++
++	mdp3_kms->iface_clk = devm_clk_get(dev, "iface");
++	if (IS_ERR(mdp3_kms->iface_clk))
++		return dev_err_probe(dev, PTR_ERR(mdp3_kms->iface_clk),
++				     "failed to get iface clock\n");
++
++	mdp3_kms->bus_clk = devm_clk_get(dev, "bus");
++	if (IS_ERR(mdp3_kms->bus_clk))
++		return dev_err_probe(dev, PTR_ERR(mdp3_kms->bus_clk),
++				     "failed to get bus clock\n");
++
++	mdp3_kms->vsync_clk = devm_clk_get(dev, "vsync");
++	if (IS_ERR(mdp3_kms->vsync_clk))
++		return dev_err_probe(dev, PTR_ERR(mdp3_kms->vsync_clk),
++				     "failed to get vsync clock\n");
++
++	return msm_drv_probe(&pdev->dev, mdp3_kms_init, &mdp3_kms->base.base);
++}
++
++static void mdp3_remove(struct platform_device *pdev)
++{
++	component_master_del(&pdev->dev, &msm_drm_ops);
++}
++
++static const struct of_device_id mdp3_dt_match[] = {
++	{ .compatible = "qcom,mdss_mdp3" },
++	{ /* sentinel */ }
++};
++MODULE_DEVICE_TABLE(of, mdp3_dt_match);
++
++static struct platform_driver mdp3_platform_driver = {
++	.probe      = mdp3_probe,
++	.remove     = mdp3_remove,
++	.shutdown   = msm_kms_shutdown,
++	.driver     = {
++		.name   = "mdp3",
++		.of_match_table = mdp3_dt_match,
++		.pm     = &mdp3_pm_ops,
++	},
++};
++
++void __init msm_mdp3_register(void)
++{
++	platform_driver_register(&mdp3_platform_driver);
++}
++
++void __exit msm_mdp3_unregister(void)
++{
++	platform_driver_unregister(&mdp3_platform_driver);
++}
+diff --git a/drivers/gpu/drm/msm/disp/mdp3/mdp3_kms.h b/drivers/gpu/drm/msm/disp/mdp3/mdp3_kms.h
+new file mode 100644
+index 000000000..782845540
+--- /dev/null
++++ b/drivers/gpu/drm/msm/disp/mdp3/mdp3_kms.h
+@@ -0,0 +1,87 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * MDP3 KMS driver (MSM8909), modeled on MDP4.
++ */
++
++#ifndef __MDP3_KMS_H__
++#define __MDP3_KMS_H__
++
++#include <linux/interconnect.h>
++#include "msm_drv.h"
++#include "msm_kms.h"
++#include "disp/mdp_kms.h"
++#include "mdp3_hw.h"
++
++struct mdp3_kms {
++	struct mdp_kms base;
++
++	struct drm_device *dev;
++
++	void __iomem *mmio;
++
++	struct clk *core_clk;
++	struct clk *iface_clk;
++	struct clk *bus_clk;
++	struct clk *vsync_clk;
++
++	/*
++	 * HACK(atv329q) §13.7: scanout bandwidth vote (MASTER_MDP -> EBI/DRAM).
++	 * Without it the NoC/BIMC stay at the bootloader default and the DMA_P
++	 * fetch is starved -> LCDC_UNDERFLOW.  See mdp3_kms_init().
++	 */
++	struct icc_path *mdp_icc;
++
++	struct mdp_irq error_handler;
++
++	bool rpm_enabled;
++
++	/*
++	 * HACK(atv329q): one-shot seamless handover.  Set at probe when the LK
++	 * bootloader left the DSI-video timing generator running (VIDEO_EN=1);
++	 * the first modeset then adopts the running pipeline (just re-points the
++	 * DMA_P scanout) instead of tearing it down + restarting it, which would
++	 * break the ADV7533's inherited lock.  Cleared after the first enable.
++	 */
++	bool handover;
++};
++#define to_mdp3_kms(x) container_of(x, struct mdp3_kms, base)
++
++static inline void mdp3_write(struct mdp3_kms *mdp3_kms, u32 reg, u32 data)
++{
++	writel(data, mdp3_kms->mmio + reg);
++}
++
++static inline u32 mdp3_read(struct mdp3_kms *mdp3_kms, u32 reg)
++{
++	return readl(mdp3_kms->mmio + reg);
++}
++
++int mdp3_disable(struct mdp3_kms *mdp3_kms);
++int mdp3_enable(struct mdp3_kms *mdp3_kms);
++
++void mdp3_set_irqmask(struct mdp_kms *mdp_kms, uint32_t irqmask,
++		uint32_t old_irqmask);
++void mdp3_irq_preinstall(struct msm_kms *kms);
++int mdp3_irq_postinstall(struct msm_kms *kms);
++void mdp3_irq_uninstall(struct msm_kms *kms);
++irqreturn_t mdp3_irq(struct msm_kms *kms);
++int mdp3_enable_vblank(struct msm_kms *kms, struct drm_crtc *crtc);
++void mdp3_disable_vblank(struct msm_kms *kms, struct drm_crtc *crtc);
++
++struct drm_plane *mdp3_plane_init(struct drm_device *dev);
++
++uint32_t mdp3_crtc_vblank(struct drm_crtc *crtc);
++void mdp3_crtc_wait_for_commit_done(struct drm_crtc *crtc);
++struct drm_crtc *mdp3_crtc_init(struct drm_device *dev,
++		struct drm_plane *plane);
++
++#ifdef CONFIG_DRM_MSM_DSI
++struct drm_encoder *mdp3_dsi_encoder_init(struct drm_device *dev);
++#else
++static inline struct drm_encoder *mdp3_dsi_encoder_init(struct drm_device *dev)
++{
++	return ERR_PTR(-ENODEV);
++}
++#endif
++
++#endif /* __MDP3_KMS_H__ */
+diff --git a/drivers/gpu/drm/msm/disp/mdp3/mdp3_plane.c b/drivers/gpu/drm/msm/disp/mdp3/mdp3_plane.c
+new file mode 100644
+index 000000000..040c89498
+--- /dev/null
++++ b/drivers/gpu/drm/msm/disp/mdp3/mdp3_plane.c
+@@ -0,0 +1,186 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * MDP3 primary plane = the DMA_P scanout engine source configuration.
++ *
++ * MDP3 has no SSPP pipes or layer mixers: DMA_P fetches a single linear
++ * RGB buffer from a physical address and feeds the video timing
++ * generator directly.  Fullscreen, no scaling, no overlays.
++ */
++
++#include <drm/drm_atomic.h>
++#include <drm/drm_atomic_helper.h>
++#include <drm/drm_damage_helper.h>
++#include <drm/drm_fourcc.h>
++#include <drm/drm_framebuffer.h>
++#include <drm/drm_gem_atomic_helper.h>
++
++#include "mdp3_kms.h"
++
++struct mdp3_plane {
++	struct drm_plane base;
++};
++#define to_mdp3_plane(x) container_of(x, struct mdp3_plane, base)
++
++static struct mdp3_kms *get_kms(struct drm_plane *plane)
++{
++	struct msm_drm_private *priv = plane->dev->dev_private;
++
++	return to_mdp3_kms(to_mdp_kms(priv->kms));
++}
++
++static uint32_t mdp3_dma_p_config(uint32_t pixel_format)
++{
++	switch (pixel_format) {
++	case DRM_FORMAT_RGB888:
++		return MDP3_DMA_P_CONFIG_DSI_VIDEO_RGB888;
++	case DRM_FORMAT_XRGB8888:
++	default:
++		return MDP3_DMA_P_CONFIG_DSI_VIDEO_XRGB8888;
++	}
++}
++
++static const struct drm_plane_funcs mdp3_plane_funcs = {
++	.update_plane = drm_atomic_helper_update_plane,
++	.disable_plane = drm_atomic_helper_disable_plane,
++	.reset = drm_atomic_helper_plane_reset,
++	.atomic_duplicate_state = drm_atomic_helper_plane_duplicate_state,
++	.atomic_destroy_state = drm_atomic_helper_plane_destroy_state,
++};
++
++static int mdp3_plane_prepare_fb(struct drm_plane *plane,
++				 struct drm_plane_state *new_state)
++{
++	if (!new_state->fb)
++		return 0;
++
++	drm_gem_plane_helper_prepare_fb(plane, new_state);
++
++	return msm_framebuffer_prepare(new_state->fb, false);
++}
++
++static void mdp3_plane_cleanup_fb(struct drm_plane *plane,
++				  struct drm_plane_state *old_state)
++{
++	struct drm_framebuffer *fb = old_state->fb;
++
++	if (!fb)
++		return;
++
++	DBG("DMA_P: cleanup: FB[%u]", fb->base.id);
++	msm_framebuffer_cleanup(fb, false);
++}
++
++static int mdp3_plane_atomic_check(struct drm_plane *plane,
++		struct drm_atomic_state *state)
++{
++	struct drm_plane_state *new_state =
++		drm_atomic_get_new_plane_state(state, plane);
++	struct drm_crtc_state *crtc_state;
++
++	if (!new_state->crtc || !new_state->fb)
++		return 0;
++
++	crtc_state = drm_atomic_get_new_crtc_state(state, new_state->crtc);
++	if (WARN_ON(!crtc_state))
++		return -EINVAL;
++
++	/* fullscreen only: no scaling, no offset */
++	return drm_atomic_helper_check_plane_state(new_state, crtc_state,
++						   DRM_PLANE_NO_SCALING,
++						   DRM_PLANE_NO_SCALING,
++						   false, true);
++}
++
++static void mdp3_plane_atomic_update(struct drm_plane *plane,
++				     struct drm_atomic_state *state)
++{
++	struct drm_plane_state *new_state =
++		drm_atomic_get_new_plane_state(state, plane);
++	struct mdp3_kms *mdp3_kms = get_kms(plane);
++	struct drm_framebuffer *fb = new_state->fb;
++	uint32_t src_w, src_h;
++
++	if (!new_state->crtc || !fb)
++		return;
++
++	src_w = new_state->src_w >> 16;
++	src_h = new_state->src_h >> 16;
++
++	DBG("FB[%u] %ux%u stride=%u iova=%08x", fb->base.id,
++	    src_w, src_h, fb->pitches[0], msm_framebuffer_iova(fb, 0));
++
++	/*
++	 * TEST(atv329q): PURE handover -- do NOT touch DMA_P at all; leave lk2nd's
++	 * fetch/buffer exactly as-is.  If lk2nd's image then PERSISTS on screen the
++	 * chip output survives the kernel and only the re-point breaks it; if it
++	 * goes black the kernel's mere presence kills the chip.  Revert after.
++	 */
++	if (mdp3_kms->handover)
++		return;
++
++	/*
++	 * Program the DMA_P fetch for OUR framebuffer (even on the LK handover):
++	 * LK's fetch config was tuned for its own fb region and underflows when
++	 * pointed at the kernel CMA fb; our config handles it.  What we must NOT
++	 * do on handover is toggle VIDEO_EN (that would drop the ADV7533's
++	 * inherited lock) -- that is handled in the encoder.  Writing the DMA_P
++	 * registers while the timing generator keeps running just updates the
++	 * fetch at the next vsync.
++	 */
++	mdp3_write(mdp3_kms, REG_MDP3_DMA_P_CONFIG,
++		   mdp3_dma_p_config(fb->format->format));
++	mdp3_write(mdp3_kms, REG_MDP3_DMA_P_SIZE, (src_h << 16) | src_w);
++	mdp3_write(mdp3_kms, REG_MDP3_DMA_P_IBUF_Y_STRIDE, fb->pitches[0]);
++	mdp3_write(mdp3_kms, REG_MDP3_DMA_P_OUT_XY, 0);
++	mdp3_write(mdp3_kms, REG_MDP3_DMA_P_FETCH_CFG,
++		   MDP3_DMA_P_FETCH_CFG_DEFAULT);
++
++	/* latched by the timing generator at the next vsync */
++	mdp3_write(mdp3_kms, REG_MDP3_DMA_P_IBUF_ADDR,
++		   msm_framebuffer_iova(fb, 0));
++
++	/*
++	 * HACK(atv329q): on the LK handover the timing generator keeps running
++	 * (we never toggle VIDEO_EN, to preserve the ADV7533 lock).  After
++	 * re-pointing DMA_P at our framebuffer, re-kick the fetch so it re-syncs
++	 * to the new address; without it the inherited TG underflows
++	 * (LCDC_UNDERFLOW) and the screen goes black.
++	 */
++	if (mdp3_kms->handover)
++		mdp3_write(mdp3_kms, REG_MDP3_DMA_P_START, 1);
++}
++
++static const struct drm_plane_helper_funcs mdp3_plane_helper_funcs = {
++	.prepare_fb = mdp3_plane_prepare_fb,
++	.cleanup_fb = mdp3_plane_cleanup_fb,
++	.atomic_check = mdp3_plane_atomic_check,
++	.atomic_update = mdp3_plane_atomic_update,
++};
++
++static const uint32_t mdp3_formats[] = {
++	DRM_FORMAT_XRGB8888,
++	DRM_FORMAT_RGB888,
++};
++
++struct drm_plane *mdp3_plane_init(struct drm_device *dev)
++{
++	struct mdp3_plane *mdp3_plane;
++	struct drm_plane *plane;
++
++	mdp3_plane = drmm_universal_plane_alloc(dev, struct mdp3_plane, base,
++						0xff, &mdp3_plane_funcs,
++						mdp3_formats,
++						ARRAY_SIZE(mdp3_formats),
++						NULL,
++						DRM_PLANE_TYPE_PRIMARY, NULL);
++	if (IS_ERR(mdp3_plane))
++		return ERR_CAST(mdp3_plane);
++
++	plane = &mdp3_plane->base;
++
++	drm_plane_helper_add(plane, &mdp3_plane_helper_funcs);
++
++	drm_plane_enable_fb_damage_clips(plane);
++
++	return plane;
++}
+diff --git a/drivers/gpu/drm/msm/msm_drv.c b/drivers/gpu/drm/msm/msm_drv.c
+index e5ab1e288..ac354100a 100644
+--- a/drivers/gpu/drm/msm/msm_drv.c
++++ b/drivers/gpu/drm/msm/msm_drv.c
+@@ -1129,6 +1129,7 @@ static int __init msm_drm_register(void)
+ 	msm_hdmi_register();
+ 	msm_dp_register();
+ 	adreno_register();
++	msm_mdp3_register();
+ 	msm_mdp4_register();
+ 	msm_mdss_register();
+ 
+@@ -1140,6 +1141,7 @@ static void __exit msm_drm_unregister(void)
+ 	DBG("fini");
+ 	msm_mdss_unregister();
+ 	msm_mdp4_unregister();
++	msm_mdp3_unregister();
+ 	msm_dp_unregister();
+ 	msm_hdmi_unregister();
+ 	adreno_unregister();
+diff --git a/drivers/gpu/drm/msm/msm_drv.h b/drivers/gpu/drm/msm/msm_drv.h
+index 6d847d593..698e1ff60 100644
+--- a/drivers/gpu/drm/msm/msm_drv.h
++++ b/drivers/gpu/drm/msm/msm_drv.h
+@@ -402,6 +402,14 @@ static inline bool msm_dp_wide_bus_available(const struct msm_dp *dp_display)
+ 
+ #endif
+ 
++#ifdef CONFIG_DRM_MSM_MDP3
++void msm_mdp3_register(void);
++void msm_mdp3_unregister(void);
++#else
++static inline void msm_mdp3_register(void) {}
++static inline void msm_mdp3_unregister(void) {}
++#endif
++
+ #ifdef CONFIG_DRM_MSM_MDP4
+ void msm_mdp4_register(void);
+ void msm_mdp4_unregister(void);
+diff --git a/drivers/gpu/drm/msm/msm_fbdev.c b/drivers/gpu/drm/msm/msm_fbdev.c
+index fd19995b1..b572c96e0 100644
+--- a/drivers/gpu/drm/msm/msm_fbdev.c
++++ b/drivers/gpu/drm/msm/msm_fbdev.c
+@@ -98,6 +98,21 @@ int msm_fbdev_driver_fbdev_probe(struct drm_fb_helper *helper,
+ 	uint32_t format;
+ 	int ret, pitch;
+ 
++	/*
++	 * HACK(atv329q): force 24bpp RGB888 (3 bytes/px, stride 3840) to match
++	 * exactly what the LK bootloader scans out.  On the seamless handover
++	 * the inherited MDP3 timing generator is calibrated for LK's 24bpp
++	 * lowmem framebuffer; a 32bpp XRGB8888 kernel fb (+33% fetch) makes that
++	 * TG underflow (continuous LCDC_UNDERFLOW -> black, see CHECKPOINT 17.22).
++	 * 24bpp + a lowmem CMA pool (cma=...@0x85000000 on the cmdline) reproduces
++	 * LK's fetch profile so the handover'd TG feeds the DSI cleanly.
++	 * (fbcon text rendering in RGB888 is imperfect -- separate issue 16.11.)
++	 */
++	if (sizes->surface_bpp == 32) {
++		sizes->surface_bpp = 24;
++		sizes->surface_depth = 24;
++	}
++
+ 	format = drm_mode_legacy_fb_format(sizes->surface_bpp, sizes->surface_depth);
+ 
+ 	DBG("create fbdev: %dx%d@%d (%dx%d)", sizes->surface_width,
+diff --git a/drivers/gpu/drm/msm/msm_gem.c b/drivers/gpu/drm/msm/msm_gem.c
+index b27abaa13..a741f6fe4 100644
+--- a/drivers/gpu/drm/msm/msm_gem.c
++++ b/drivers/gpu/drm/msm/msm_gem.c
+@@ -107,6 +107,10 @@ void msm_gem_vma_put(struct drm_gem_object *obj)
+ #ifdef CONFIG_DRM_MSM_KMS
+ 	struct drm_exec exec;
+ 
++	/* KMS without display IOMMU: no kms->vm, hence no VMAs to put */
++	if (!priv->kms->vm)
++		return;
++
+ 	msm_gem_lock_vm_and_obj(&exec, obj, priv->kms->vm);
+ 	put_iova_spaces(obj, priv->kms->vm, true, "vma_put");
+ 	drm_exec_fini(&exec);     /* drop locks */
+@@ -184,12 +188,96 @@ static void update_lru(struct drm_gem_object *obj)
+ 	mutex_unlock(&priv->lru.lock);
+ }
+ 
++/*
++ * Backing for MSM_BO_CONTIG objects: physically contiguous DMA memory
++ * (CMA), for KMS without a display IOMMU (e.g. MDP3 on msm8909) where
++ * the scanout engine fetches from a flat device address.
++ */
++static struct page **get_pages_contig(struct drm_gem_object *obj)
++{
++	struct msm_gem_object *msm_obj = to_msm_bo(obj);
++	struct drm_device *dev = obj->dev;
++	size_t npages = obj->size >> PAGE_SHIFT;
++	struct sg_table *sgt;
++	struct page **p;
++	size_t i;
++	int ret;
++
++	msm_obj->dma_cookie = dma_alloc_attrs(dev->dev, obj->size,
++					      &msm_obj->paddr, GFP_KERNEL,
++					      DMA_ATTR_WRITE_COMBINE);
++	if (!msm_obj->dma_cookie) {
++		DRM_DEV_ERROR(dev->dev, "could not allocate %zu contig bytes\n",
++			      obj->size);
++		return ERR_PTR(-ENOMEM);
++	}
++
++	p = kvmalloc_objs(struct page *, npages);
++	sgt = kzalloc_obj(*sgt);
++	if (!p || !sgt) {
++		ret = -ENOMEM;
++		goto fail;
++	}
++
++	ret = dma_get_sgtable_attrs(dev->dev, sgt, msm_obj->dma_cookie,
++				    msm_obj->paddr, obj->size,
++				    DMA_ATTR_WRITE_COMBINE);
++	if (ret)
++		goto fail;
++
++	for (i = 0; i < npages; i++)
++		p[i] = sg_page(sgt->sgl) + i;
++
++	update_device_mem(dev->dev_private, obj->size);
++
++	msm_obj->pages = p;
++	msm_obj->sgt = sgt;
++
++	update_lru(obj);
++
++	return p;
++
++fail:
++	kvfree(p);
++	kfree(sgt);
++	dma_free_attrs(dev->dev, obj->size, msm_obj->dma_cookie,
++		       msm_obj->paddr, DMA_ATTR_WRITE_COMBINE);
++	msm_obj->dma_cookie = NULL;
++	return ERR_PTR(ret);
++}
++
++static void put_pages_contig(struct drm_gem_object *obj)
++{
++	struct msm_gem_object *msm_obj = to_msm_bo(obj);
++
++	if (!msm_obj->pages)
++		return;
++
++	sg_free_table(msm_obj->sgt);
++	kfree(msm_obj->sgt);
++	msm_obj->sgt = NULL;
++
++	update_device_mem(obj->dev->dev_private, -obj->size);
++
++	dma_free_attrs(obj->dev->dev, obj->size, msm_obj->dma_cookie,
++		       msm_obj->paddr, DMA_ATTR_WRITE_COMBINE);
++	msm_obj->dma_cookie = NULL;
++
++	kvfree(msm_obj->pages);
++	msm_obj->pages = NULL;
++
++	update_lru(obj);
++}
++
+ static struct page **get_pages(struct drm_gem_object *obj)
+ {
+ 	struct msm_gem_object *msm_obj = to_msm_bo(obj);
+ 
+ 	msm_gem_assert_locked(obj);
+ 
++	if ((msm_obj->flags & MSM_BO_CONTIG) && !msm_obj->pages)
++		return get_pages_contig(obj);
++
+ 	if (!msm_obj->pages) {
+ 		struct drm_device *dev = obj->dev;
+ 		struct page **p;
+@@ -239,6 +327,11 @@ static void put_pages(struct drm_gem_object *obj)
+ 	if (kref_read(&obj->refcount))
+ 		drm_gpuvm_bo_gem_evict(obj, true);
+ 
++	if (msm_obj->flags & MSM_BO_CONTIG) {
++		put_pages_contig(obj);
++		return;
++	}
++
+ 	if (msm_obj->pages) {
+ 		if (msm_obj->sgt) {
+ 			/* For non-cached buffers, ensure the new
+@@ -556,6 +649,25 @@ int msm_gem_get_and_pin_iova_range(struct drm_gem_object *obj,
+ 	struct drm_exec exec;
+ 	int ret;
+ 
++	/*
++	 * No VM (KMS without display IOMMU): the scanout hardware uses the
++	 * physical address of the contiguous backing directly.  Never enter
++	 * msm_gem_lock_vm_and_obj() with a NULL vm.
++	 */
++	if (!vm) {
++		struct page **p;
++
++		msm_gem_lock(obj);
++		p = msm_gem_get_pages_locked(obj, MSM_MADV_WILLNEED);
++		if (!IS_ERR(p)) {
++			pin_obj_locked(obj);
++			*iova = to_msm_bo(obj)->paddr;
++		}
++		msm_gem_unlock(obj);
++
++		return PTR_ERR_OR_ZERO(p);
++	}
++
+ 	msm_gem_lock_vm_and_obj(&exec, obj, vm);
+ 	ret = get_and_pin_iova_range_locked(obj, vm, iova, range_start, range_end);
+ 	drm_exec_fini(&exec);     /* drop locks */
+@@ -659,6 +771,14 @@ void msm_gem_unpin_iova(struct drm_gem_object *obj, struct drm_gpuvm *vm)
+ 	struct drm_gpuva *vma;
+ 	struct drm_exec exec;
+ 
++	/* No VM (KMS without display IOMMU): there is no vma to tear down */
++	if (!vm) {
++		msm_gem_lock(obj);
++		msm_gem_unpin_locked(obj);
++		msm_gem_unlock(obj);
++		return;
++	}
++
+ 	msm_gem_lock_vm_and_obj(&exec, obj, vm);
+ 	vma = lookup_vma(obj, vm);
+ 	if (vma) {
+@@ -1245,6 +1365,14 @@ struct drm_gem_object *msm_gem_new(struct drm_device *dev, size_t size, uint32_t
+ 	if (size == 0)
+ 		return ERR_PTR(-EINVAL);
+ 
++	/*
++	 * KMS without a display IOMMU (kms->vm == NULL, e.g. MDP3): every
++	 * BO must be physically contiguous so that scanout can fetch from
++	 * the flat physical address.
++	 */
++	if (priv->kms && !priv->kms->vm)
++		flags |= MSM_BO_CONTIG;
++
+ 	ret = msm_gem_new_impl(dev, flags, &obj);
+ 	if (ret)
+ 		return ERR_PTR(ret);
+diff --git a/drivers/gpu/drm/msm/msm_gem.h b/drivers/gpu/drm/msm/msm_gem.h
+index cb32093fd..196694ff1 100644
+--- a/drivers/gpu/drm/msm/msm_gem.h
++++ b/drivers/gpu/drm/msm/msm_gem.h
+@@ -23,6 +23,7 @@
+ /* Additional internal-use only BO flags: */
+ #define MSM_BO_STOLEN        0x10000000    /* try to use stolen/splash memory */
+ #define MSM_BO_MAP_PRIV      0x20000000    /* use IOMMU_PRIV when mapping */
++#define MSM_BO_CONTIG        0x40000000    /* phys-contiguous (no display IOMMU) */
+ 
+ /**
+  * struct msm_gem_vm_log_entry - An entry in the VM log
+@@ -219,6 +220,14 @@ struct msm_gem_object {
+ 	struct sg_table *sgt;
+ 	void *vaddr;
+ 
++	/*
++	 * For MSM_BO_CONTIG objects (scanout without a display IOMMU, e.g.
++	 * MDP3): the dma_alloc_attrs() cookie and the device address used
++	 * directly by the scanout hardware in place of an iova.
++	 */
++	void *dma_cookie;
++	dma_addr_t paddr;
++
+ 	char name[32]; /* Identifier to print for the debugfs files */
+ 
+ 	/* userspace metadata backchannel */
+diff --git a/drivers/gpu/drm/msm/msm_kms.h b/drivers/gpu/drm/msm/msm_kms.h
+index 8a7be7b85..a37a14b77 100644
+--- a/drivers/gpu/drm/msm/msm_kms.h
++++ b/drivers/gpu/drm/msm/msm_kms.h
+@@ -139,6 +139,25 @@ struct msm_kms {
+ 	const struct msm_kms_funcs *funcs;
+ 	struct drm_device *dev;
+ 
++	/*
++	 * HACK(atv329q): lk2nd left the DSI link + ADV7533 running and the panel
++	 * lit.  Set by mdp3_kms_init() when the MDP3 TG is found already running.
++	 * The DSI manager reads it to ADOPT lk2nd's running PHY/PLL/host instead
++	 * of resetting them (a reset glitches the byte-clock and the ADV7533
++	 * drops its lock -> black).
++	 */
++	bool lk_handover;
++
++	/*
++	 * HACK(atv329q) ÉTAPE 1: defer the DSI host video stream so the ADV7533
++	 * bridge can configure + HDMI-arm the chip BEFORE the stream starts
++	 * (lk2nd's deterministic ordering).  Set by mdp3_kms_init() on the clean
++	 * bring-up; read by dsi_mgr_bridge_enable() to SKIP msm_dsi_host_enable()
++	 * -- the adv7533 bridge starts the stream after its chip program instead
++	 * (adv7533_atv329q_lk2nd_program()).
++	 */
++	bool lk_seq;
++
+ 	struct hdmi *hdmi;
+ 
+ 	struct msm_dsi *dsi[MSM_DSI_CONTROLLER_COUNT];
+diff --git a/drivers/soc/qcom/ubwc_config.c b/drivers/soc/qcom/ubwc_config.c
+index 1c25aaf55..5b7c649a4 100644
+--- a/drivers/soc/qcom/ubwc_config.c
++++ b/drivers/soc/qcom/ubwc_config.c
+@@ -247,6 +247,7 @@ static const struct of_device_id qcom_ubwc_configs[] __maybe_unused = {
+ 	{ .compatible = "qcom,kaanapali", .data = &kaanapali_data, },
+ 	{ .compatible = "qcom,glymur", .data = &glymur_data},
+ 	{ .compatible = "qcom,msm8226", .data = &no_ubwc_data },
++	{ .compatible = "qcom,msm8909", .data = &no_ubwc_data },
+ 	{ .compatible = "qcom,msm8916", .data = &no_ubwc_data },
+ 	{ .compatible = "qcom,msm8917", .data = &no_ubwc_data },
+ 	{ .compatible = "qcom,msm8937", .data = &msm8937_data },

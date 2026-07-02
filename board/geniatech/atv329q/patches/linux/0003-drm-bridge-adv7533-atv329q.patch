@@ -1,0 +1,304 @@
+drm/bridge: adv7533 DSI->HDMI bring-up for the atv329q
+
+diff --git a/drivers/gpu/drm/bridge/adv7511/adv7511.h b/drivers/gpu/drm/bridge/adv7511/adv7511.h
+index 8be7266fd..78cf556f1 100644
+--- a/drivers/gpu/drm/bridge/adv7511/adv7511.h
++++ b/drivers/gpu/drm/bridge/adv7511/adv7511.h
+@@ -418,6 +418,8 @@ int adv7511_cec_irq_process(struct adv7511 *adv7511, unsigned int irq1);
+ void adv7533_dsi_power_on(struct adv7511 *adv);
+ void adv7533_dsi_power_off(struct adv7511 *adv);
+ void adv7533_dsi_config_timing_gen(struct adv7511 *adv);
++/* HACK(atv329q) ÉTAPE 1: verbatim lk2nd chip bring-up + deferred stream start */
++void adv7533_atv329q_lk2nd_program(struct adv7511 *adv);
+ enum drm_mode_status adv7533_mode_valid(struct adv7511 *adv,
+ 					const struct drm_display_mode *mode);
+ int adv7533_patch_registers(struct adv7511 *adv);
+diff --git a/drivers/gpu/drm/bridge/adv7511/adv7511_drv.c b/drivers/gpu/drm/bridge/adv7511/adv7511_drv.c
+index 1050bb622..aaa4931a7 100644
+--- a/drivers/gpu/drm/bridge/adv7511/adv7511_drv.c
++++ b/drivers/gpu/drm/bridge/adv7511/adv7511_drv.c
+@@ -789,6 +789,32 @@ static void adv7511_bridge_atomic_enable(struct drm_bridge *bridge,
+ 	struct drm_connector *connector;
+ 	struct drm_connector_state *conn_state;
+ 	struct drm_crtc_state *crtc_state;
++	unsigned int dbg_vic = 0, dbg_pwr = 0;
++
++	/* DEBUG(atv329q): leftover chip state from the bootloader (lk2nd) before
++	 * we touch anything -> tells us if a seamless handover is possible. */
++	regmap_read(adv->regmap, ADV7511_REG_VIC_DETECTED, &dbg_vic);
++	regmap_read(adv->regmap, ADV7511_REG_POWER, &dbg_pwr);
++	dev_info(&adv->i2c_main->dev,
++		 "atv329q: pre-enable leftover VIC_DETECTED(0x3e)=0x%02x POWER(0x41)=0x%02x\n",
++		 dbg_vic, dbg_pwr);
++
++	/*
++	 * HACK(atv329q): SEAMLESS HANDOVER.  The LK bootloader (lk2nd) leaves
++	 * the ADV7533 forwarding the DSI video to HDMI (VIC_DETECTED=0x10).
++	 * Re-running adv7511_power_on() here power-cycles/re-configures the chip
++	 * and that bring-up is non-deterministic -> the chip flakily fails to
++	 * re-lock and the screen stays black.  When the chip is ALREADY
++	 * forwarding, don't touch it: the MDP3 just re-points its scanout to the
++	 * kernel framebuffer and the (still-running) chip keeps outputting.
++	 */
++	/* TEST(atv329q): handover abandoned -> always do a full chip bring-up. */
++	if (0 && adv->info->has_dsi && dbg_vic == 0x10) {
++		dev_info(&adv->i2c_main->dev,
++			 "atv329q: chip already forwarding -> seamless handover (skip re-init)\n");
++		adv->powered = true;
++		return;
++	}
+ 
+ 	adv7511_power_on(adv);
+ 
+@@ -809,6 +835,18 @@ static void adv7511_bridge_atomic_enable(struct drm_bridge *bridge,
+ 	adv7511_mode_set(adv, &crtc_state->adjusted_mode);
+ 
+ 	drm_atomic_helper_connector_hdmi_update_infoframes(connector, state);
++
++	/*
++	 * HACK(atv329q) ÉTAPE 1: replay lk2nd's EXACT ADV7533 sequence as the
++	 * authoritative final config -- correct register order, the 5ms settle
++	 * delays, and the HDMI re-arm (0x03 off->on) as the last write -- then
++	 * start the (deferred) DSI video stream so the chip is fully configured
++	 * BEFORE the stream, matching lk2nd's deterministic ordering.  This
++	 * supersedes the earlier 3-register bake (0xaf/0x40/0xd6), which is now
++	 * part of the verbatim common_cfg.  See adv7533_atv329q_lk2nd_program().
++	 */
++	if (adv->info->has_dsi)
++		adv7533_atv329q_lk2nd_program(adv);
+ }
+ 
+ static void adv7511_bridge_atomic_disable(struct drm_bridge *bridge,
+diff --git a/drivers/gpu/drm/bridge/adv7511/adv7533.c b/drivers/gpu/drm/bridge/adv7511/adv7533.c
+index 188c1093a..3ce2866f9 100644
+--- a/drivers/gpu/drm/bridge/adv7511/adv7533.c
++++ b/drivers/gpu/drm/bridge/adv7511/adv7533.c
+@@ -3,16 +3,30 @@
+  * Copyright (c) 2016, The Linux Foundation. All rights reserved.
+  */
+ 
++#include <linux/delay.h>
+ #include <linux/of_graph.h>
+ 
+ #include "adv7511.h"
+ 
++/*
++ * HACK(atv329q) ÉTAPE 1: msm_dsi_host_enable() is declared in msm's private
++ * dsi.h.  Both DRM_MSM and DRM_I2C_ADV7511 are built-in (=y) on this board, so
++ * the linker resolves the symbol directly without an EXPORT_SYMBOL.  It starts
++ * the DSI host video engine (op mode + VID_EN); we call it LAST, after the chip
++ * is fully configured, to match lk2nd's ordering (see adv7533_atv329q_lk2nd_program).
++ */
++extern int msm_dsi_host_enable(struct mipi_dsi_host *host);
++
+ static const struct reg_sequence adv7533_fixed_registers[] = {
+ 	{ 0x16, 0x20 },
+ 	{ 0x9a, 0xe0 },
+ 	{ 0xba, 0x70 },
+ 	{ 0xde, 0x82 },
+-	{ 0xe4, 0x40 },
++	/*
++	 * HACK(atv329q): vendor/LK programs 0xe4 = 0xc0 (not 0x40) on the
++	 * msm8909 Geniatech board; matches the working bootloader config.
++	 */
++	{ 0xe4, 0xc0 },
+ 	{ 0xe5, 0x80 },
+ };
+ 
+@@ -38,9 +52,15 @@ void adv7533_dsi_config_timing_gen(struct adv7511 *adv)
+ 	vfp = mode->vsync_start - mode->vdisplay;
+ 	vbp = mode->vtotal - mode->vsync_end;
+ 
+-	/* set pixel clock divider mode */
++	/*
++	 * Set pixel clock divider mode.  HACK(atv329q): the vendor/LK config
++	 * programs 0x24 here for the 3-lane 720p setup, i.e. divider (4 << 3)
++	 * with bit 2 also set; without bit 2 the ADV7533 DSI PLL never locks
++	 * on this board (verified on silicon: 0x20 -> 0x9e=0x08 unlocked,
++	 * 0x24 -> 0x9e=0x18 locked).
++	 */
+ 	regmap_write(adv->regmap_cec, 0x16,
+-		     clock_div_by_lanes[dsi->lanes - 2] << 3);
++		     (clock_div_by_lanes[dsi->lanes - 2] << 3) | 0x04);
+ 
+ 	/* horizontal porch params */
+ 	regmap_write(adv->regmap_cec, 0x28, mode->htotal >> 4);
+@@ -61,6 +81,20 @@ void adv7533_dsi_config_timing_gen(struct adv7511 *adv)
+ 	regmap_write(adv->regmap_cec, 0x35, (vfp << 4) & 0xff);
+ 	regmap_write(adv->regmap_cec, 0x36, vbp >> 4);
+ 	regmap_write(adv->regmap_cec, 0x37, (vbp << 4) & 0xff);
++
++	/*
++	 * HACK(atv329q): replicate lk2nd's exact final enable step.  The
++	 * bootloader programs the whole timing generator (the 0x16/0x28..0x37
++	 * writes above) and THEN re-arms the HDMI path by toggling the CEC/DSI
++	 * 0x03 HDMI-enable bit off->on, with test-pattern disabled.  This is
++	 * the deterministic "display on" for this chip -- no DSI DCS needed
++	 * (see adv7533_dsi_power_on()).  config_timing_gen() runs from
++	 * adv7511_mode_set(), i.e. after adv7533_dsi_power_on(), so the order
++	 * matches lk2nd: timing first, HDMI re-arm last.
++	 */
++	regmap_write(adv->regmap_cec, 0x55, 0x00);	/* test pattern disable */
++	regmap_write(adv->regmap_cec, 0x03, 0x09);	/* HDMI disable */
++	regmap_write(adv->regmap_cec, 0x03, 0x89);	/* HDMI enable (re-arm) */
+ }
+ 
+ void adv7533_dsi_power_on(struct adv7511 *adv)
+@@ -87,6 +121,136 @@ void adv7533_dsi_power_on(struct adv7511 *adv)
+ 
+ 	regmap_register_patch(adv->regmap_cec, adv7533_cec_fixed_registers,
+ 			      ARRAY_SIZE(adv7533_cec_fixed_registers));
++
++	/*
++	 * HACK(atv329q): do NOT send any DSI DCS command to this chip.
++	 *
++	 * Earlier sessions chased "deliver DCS exit_sleep_mode/set_display_on
++	 * reliably" (the vendor *Android* DTS lists them as panel on-commands),
++	 * which led to the catch-22 flakiness (PLL-lock vs VIC anti-correlation,
++	 * see CHECKPOINT.md 16.11/16.12/17.12-17.16).
++	 *
++	 * But the deterministic bootloader (lk2nd) sends NO DCS at all: it
++	 * configures the ADV7533 purely over i2c and arms the HDMI path with
++	 * the CEC/DSI 0x03 register (HDMI-enable bit7), toggling it off->on
++	 * AFTER the timing generator is programmed (done in
++	 * adv7533_dsi_config_timing_gen()).  The datasheet confirms the DSI Rx
++	 * is *video-mode only* -- injecting LP DCS packets around the video
++	 * stream is what perturbs the receiver PLL/VIC lock.  So: no DCS here;
++	 * the HDMI re-arm lives at the end of config_timing_gen, like lk2nd.
++	 */
++}
++
++/*
++ * HACK(atv329q) ÉTAPE 1: replay lk2nd's EXACT ADV7533 i2c bring-up.
++ *
++ * We had matched lk2nd's register VALUES (what finally lit the screen on
++ * 2026-06-24) but never its ORDER + delays, and we programmed the chip AFTER
++ * the DSI video stream was already running.  lk2nd is deterministic (lights
++ * HDMI 100% in a single shot); its sequence is:
++ *   1. bring the DSI PLL/byte-clock up (clock lane active, video stream OFF)
++ *   2. write common_cfg (19 regs; 5ms settle after the first two: 0xd6, 0x41)
++ *   3. write the timing generator (22 regs), re-arming HDMI with the CEC/DSI
++ *      0x03 enable bit toggled off->on as the LAST step
++ *   4. THEN start the video stream
++ * This function replays steps 2+3 verbatim, then does step 4 by starting the
++ * (deferred, see dsi_manager.c + msm_kms.lk_seq) msm DSI host video engine, so
++ * the chip locks onto a fully-configured, stable stream -- lk2nd's ordering.
++ *
++ * Source: lk2nd dev/gcdb/display/include/panel_adv7533_720p60.h
++ *         (adv7533_720p_common_cfg[] + adv7533_720p_tg_i2c_command[]) and
++ *         target/msm8916/target_display.c:dsi2HDMI_i2c_write_regs().
++ *
++ * Maps: ADV7533_MAIN -> adv->regmap, ADV7533_CEC_DSI -> adv->regmap_cec.
++ */
++enum adv_lk_map { LK_MAIN, LK_CEC };
++
++struct adv_lk_cmd {
++	enum adv_lk_map map;
++	u8 reg;
++	u8 val;
++	u16 delay_us;	/* settle delay AFTER the write (lk2nd sleep_in_ms) */
++};
++
++static const struct adv_lk_cmd adv7533_lk2nd_common_cfg[] = {
++	{ LK_MAIN, 0xd6, 0x48, 5000 },	/* HPD overridden */
++	{ LK_MAIN, 0x41, 0x10, 5000 },	/* HDMI normal (power up) */
++	{ LK_CEC,  0x03, 0x89, 0 },	/* HDMI enabled */
++	{ LK_MAIN, 0x16, 0x20, 0 },
++	{ LK_MAIN, 0x9a, 0xe0, 0 },
++	{ LK_MAIN, 0xba, 0x70, 0 },
++	{ LK_MAIN, 0xde, 0x82, 0 },
++	{ LK_MAIN, 0xe4, 0xc0, 0 },
++	{ LK_MAIN, 0xe5, 0x80, 0 },
++	{ LK_CEC,  0x15, 0xd0, 0 },
++	{ LK_CEC,  0x17, 0xd0, 0 },
++	{ LK_CEC,  0x24, 0x20, 0 },
++	{ LK_CEC,  0x57, 0x11, 0 },
++	{ LK_MAIN, 0xaf, 0x06, 0 },	/* HDMI mode (not DVI) */
++	{ LK_MAIN, 0x40, 0x80, 0 },	/* HDMI output enable */
++	{ LK_MAIN, 0x4c, 0x04, 0 },
++	{ LK_MAIN, 0x49, 0x02, 0 },
++	{ LK_MAIN, 0x0d, 0x40, 0 },	/* 1 << 6 */
++	{ LK_CEC,  0x1c, 0x30, 0 },	/* 3 lanes */
++};
++
++static const struct adv_lk_cmd adv7533_lk2nd_tg[] = {
++	{ LK_CEC,  0x1c, 0x30, 0 },	/* 3 lanes */
++	{ LK_MAIN, 0x17, 0x02, 0 },	/* hsync/vsync active low */
++	{ LK_CEC,  0x16, 0x24, 0 },	/* pixel clock divider (3 lanes) */
++	{ LK_CEC,  0x28, 0x67, 0 },	/* h_width 1650 */
++	{ LK_CEC,  0x29, 0x20, 0 },
++	{ LK_CEC,  0x2a, 0x02, 0 },	/* hsync_width 40 */
++	{ LK_CEC,  0x2b, 0x80, 0 },
++	{ LK_CEC,  0x2c, 0x06, 0 },	/* hfp 110 */
++	{ LK_CEC,  0x2d, 0xe0, 0 },
++	{ LK_CEC,  0x2e, 0x0d, 0 },	/* hbp 220 */
++	{ LK_CEC,  0x2f, 0xc0, 0 },
++	{ LK_CEC,  0x30, 0x2e, 0 },	/* v_total 750 */
++	{ LK_CEC,  0x31, 0xe0, 0 },
++	{ LK_CEC,  0x32, 0x00, 0 },	/* vsync_width 5 */
++	{ LK_CEC,  0x33, 0x50, 0 },
++	{ LK_CEC,  0x34, 0x00, 0 },	/* vfp 5 */
++	{ LK_CEC,  0x35, 0x50, 0 },
++	{ LK_CEC,  0x36, 0x01, 0 },	/* vbp 20 */
++	{ LK_CEC,  0x37, 0x40, 0 },
++	{ LK_CEC,  0x55, 0x00, 0 },	/* test pattern disable */
++	{ LK_CEC,  0x03, 0x09, 0 },	/* HDMI disable */
++	{ LK_CEC,  0x03, 0x89, 0 },	/* HDMI enable (re-arm) */
++};
++
++static void adv7533_lk2nd_write_seq(struct adv7511 *adv,
++				    const struct adv_lk_cmd *seq, int n)
++{
++	int i;
++
++	for (i = 0; i < n; i++) {
++		struct regmap *map = (seq[i].map == LK_MAIN) ?
++				     adv->regmap : adv->regmap_cec;
++
++		regmap_write(map, seq[i].reg, seq[i].val);
++		if (seq[i].delay_us)
++			usleep_range(seq[i].delay_us, seq[i].delay_us + 1000);
++	}
++}
++
++void adv7533_atv329q_lk2nd_program(struct adv7511 *adv)
++{
++	adv7533_lk2nd_write_seq(adv, adv7533_lk2nd_common_cfg,
++				ARRAY_SIZE(adv7533_lk2nd_common_cfg));
++	adv7533_lk2nd_write_seq(adv, adv7533_lk2nd_tg,
++				ARRAY_SIZE(adv7533_lk2nd_tg));
++
++	/*
++	 * lk2nd step 4: the chip is now configured + HDMI-armed while the video
++	 * stream is still off; start the DSI host video engine LAST so the chip
++	 * locks onto a fully-configured, stable stream.  The stream was deferred
++	 * out of dsi_mgr_bridge_enable() (msm_kms.lk_seq).  Idempotent if lk_seq
++	 * was not set (dsi_mgr already enabled it) since msm_dsi_host_enable()
++	 * just (re)sets the op mode + enabled flag.
++	 */
++	if (adv->dsi && adv->dsi->host)
++		msm_dsi_host_enable(adv->dsi->host);
+ }
+ 
+ void adv7533_dsi_power_off(struct adv7511 *adv)
+@@ -149,8 +313,19 @@ int adv7533_attach_dsi(struct adv7511 *adv)
+ 
+ 	dsi->lanes = adv->num_dsi_lanes;
+ 	dsi->format = MIPI_DSI_FMT_RGB888;
++	/*
++	 * HACK(atv329q): SET MIPI_DSI_MODE_VIDEO_HSE -> PULSE_MODE_HSA_HE
++	 * (VID_CFG0 bit 28).  CORRECTION: the previous comment claimed lk2nd
++	 * runs WITHOUT this bit -- that was wrong.  lk2nd's panel config sets
++	 * videopanel_info.hsync_pulse=1, which maps to pinfo->mipi.pulse_mode_hsa_he
++	 * (panel_display.c:220) -> VID_CFG0 bit 28 SET.  Without it the ADV7533
++	 * DSI-RX detects the timing (VIC=0x10) but the line sync is malformed in
++	 * sync-pulse mode -> the chip rejects the pixels (black) even with an
++	 * otherwise perfect pipeline.  This was the LAST DSI-stream delta vs lk2nd.
++	 */
+ 	dsi->mode_flags = MIPI_DSI_MODE_VIDEO | MIPI_DSI_MODE_VIDEO_SYNC_PULSE |
+-			  MIPI_DSI_MODE_NO_EOT_PACKET | MIPI_DSI_MODE_VIDEO_HSE;
++			  MIPI_DSI_MODE_VIDEO_HSE |
++			  MIPI_DSI_MODE_NO_EOT_PACKET;
+ 
+ 	ret = devm_mipi_dsi_attach(dev, dsi);
+ 	if (ret < 0)

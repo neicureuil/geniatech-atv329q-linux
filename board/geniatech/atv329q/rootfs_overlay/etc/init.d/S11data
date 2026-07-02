@@ -1,0 +1,20 @@
+#!/bin/sh
+# atv329q: format (first boot) + mount the large userdata partition (mmcblk0p31,
+# ~5.5 GiB) as /data, so the box uses the whole eMMC (rootfs on system=p22 is
+# only ~1.2 GiB).
+DEV=/dev/mmcblk0p31
+case "$1" in
+  start)
+    mkdir -p /data
+    if ! blkid "$DEV" 2>/dev/null | grep -q 'TYPE="ext4"'; then
+      echo "S11data: formatting $DEV as ext4 (first boot, ~5.5G)..."
+      mkfs.ext4 -q -F -L data "$DEV" || { echo "S11data: mkfs failed"; exit 1; }
+    fi
+    mount -t ext4 -o noatime "$DEV" /data && \
+      echo "S11data: /data mounted ($(df -h /data | tail -1))"
+    ;;
+  stop)
+    umount /data 2>/dev/null ;;
+  restart|reload)
+    "$0" stop; "$0" start ;;
+esac

@@ -1,0 +1,45 @@
+clk: qcom: gcc-msm8909 MDSS AXI clock freq table (scanout bandwidth)
+
+diff --git a/drivers/clk/qcom/gcc-msm8909.c b/drivers/clk/qcom/gcc-msm8909.c
+index cc36e81bc..753ca3f07 100644
+--- a/drivers/clk/qcom/gcc-msm8909.c
++++ b/drivers/clk/qcom/gcc-msm8909.c
+@@ -904,9 +904,25 @@ static struct clk_rcg2 sdcc2_apps_clk_src = {
+ 	}
+ };
+ 
++/*
++ * HACK(atv329q): give the system NoC a freq table so its rate can be set.
++ * The MDSS AXI branch (gcc_mdss_axi_clk) hangs off this; without a table the
++ * NoC stays at the bootloader default and the MDP3 scanout fetch is starved
++ * under CPU/WiFi bus contention -> LCDC underflow -> black. Allow up to 266 MHz.
++ */
++static const struct freq_tbl ftbl_system_noc_bfdcd_clk_src[] = {
++	F(100000000, P_GPLL0, 8, 0, 0),
++	F(133330000, P_GPLL0, 6, 0, 0),
++	F(160000000, P_GPLL0, 5, 0, 0),
++	F(200000000, P_GPLL0, 4, 0, 0),
++	F(266670000, P_GPLL0, 3, 0, 0),
++	{ }
++};
++
+ static struct clk_rcg2 system_noc_bfdcd_clk_src = {
+ 	.cmd_rcgr = 0x26004,
+ 	.hid_width = 5,
++	.freq_tbl = ftbl_system_noc_bfdcd_clk_src,
+ 	.parent_map = gcc_xo_gpll0_bimc_map,
+ 	.clkr.hw.init = &(struct clk_init_data) {
+ 		.name = "system_noc_bfdcd_clk_src",
+@@ -2030,6 +2046,12 @@ static struct clk_branch gcc_mdss_axi_clk = {
+ 				&system_noc_bfdcd_clk_src.clkr.hw,
+ 			},
+ 			.num_parents = 1,
++			/*
++			 * HACK(atv329q): propagate clk_set_rate from the MDP3
++			 * driver's "bus" clock to the system NoC so the scanout
++			 * fetch bandwidth can actually be raised (else no-op).
++			 */
++			.flags = CLK_SET_RATE_PARENT,
+ 			.ops = &clk_branch2_ops,
+ 		}
+ 	}

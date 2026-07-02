@@ -1,0 +1,12 @@
+# WiFi (wcn36xx / WCNSS) template.
+#
+# Copy this file to rootfs_overlay/etc/wpa_supplicant.conf and fill in your
+# network, then build. The real rootfs_overlay/etc/wpa_supplicant.conf is
+# git-ignored so credentials never land in the repo. If it is absent, the build
+# still works and S12wifi just skips WiFi (eth0 / SSH are unaffected).
+ctrl_interface=/var/run/wpa_supplicant
+update_config=1
+network={
+	ssid="YOUR_SSID"
+	psk="YOUR_PASSPHRASE"
+}

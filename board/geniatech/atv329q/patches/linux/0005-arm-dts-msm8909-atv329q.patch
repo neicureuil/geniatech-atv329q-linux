@@ -1,0 +1,507 @@
+ARM: dts: qcom: atv329q board (display + USB host + interconnect)
+
+diff --git a/arch/arm/boot/dts/qcom/Makefile b/arch/arm/boot/dts/qcom/Makefile
+index 486d6ce00..78a8d2fc8 100644
+--- a/arch/arm/boot/dts/qcom/Makefile
++++ b/arch/arm/boot/dts/qcom/Makefile
+@@ -34,6 +34,7 @@ dtb-$(CONFIG_ARCH_QCOM) += \
+ 	qcom-msm8660-surf.dtb \
+ 	qcom-msm8905-nokia-argon.dtb \
+ 	qcom-msm8909-acer-t01.dtb \
++	qcom-msm8909-geniatech-atv329q.dtb \
+ 	qcom-msm8909-fareastone-smart506.dtb \
+ 	qcom-msm8909-lenovo-lxf-p5000.dtb \
+ 	qcom-msm8909-lenovo-lxf-p5100.dtb \
+diff --git a/arch/arm/boot/dts/qcom/qcom-msm8909-geniatech-atv329q.dts b/arch/arm/boot/dts/qcom/qcom-msm8909-geniatech-atv329q.dts
+new file mode 100644
+index 000000000..34a180199
+--- /dev/null
++++ b/arch/arm/boot/dts/qcom/qcom-msm8909-geniatech-atv329q.dts
+@@ -0,0 +1,329 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Geniatech atv329q (MSM8909 ARD Loong) Android TV box.
++ * First-draft mainline DT. Uses simple-framebuffer on the bootloader's
++ * HDMI (ADV7533) 720p framebuffer for an early reliable console.
++ */
++
++/dts-v1/;
++
++#include "qcom-msm8909-pm8909.dtsi"
++
++#include <dt-bindings/gpio/gpio.h>
++#include <dt-bindings/input/input.h>
++#include <dt-bindings/interconnect/qcom,msm8909.h>
++
++/ {
++	model = "Geniatech atv329q";
++	compatible = "geniatech,atv329q", "qcom,msm8909";
++	chassis-type = "embedded";
++
++	aliases {
++		serial0 = &blsp_uart1;
++	};
++
++	chosen {
++		#address-cells = <1>;
++		#size-cells = <1>;
++		ranges;
++
++		stdout-path = "serial0";
++		/*
++		 * cmdline: under lk2nd, ATAG_CMDLINE from the boot.img REPLACES this
++		 * (CMDLINE_FROM_BOOTLOADER).  Under the stock aboot (QCDT, no ATAGs)
++		 * this bootargs IS what the kernel uses -> it must carry video= for the
++		 * MDP3/ADV7533 720p mode, plus panic=5/softlockup auto-reboot safety.
++		 */
++		bootargs = "console=tty0 console=ttyMSM0,115200 video=HDMI-A-1:1280x720@60 root=/dev/mmcblk0p22 rootwait rw panic=5";
++
++		/*
++		 * HACK(atv329q ÉTAPE 2): NO hardcoded linux,initrd-start/end.  The stock
++		 * aboot does NOT load the external ramdisk at the boot.img raddr the
++		 * appended-DTB kernel would expect, so pinning initrd here made the
++		 * kernel unpack GARBAGE at 0x84000000 -> corruption/hang before /init.
++		 * Instead the initramfs is BAKED INTO the kernel (CONFIG_INITRAMFS_SOURCE,
++		 * see build-kernel.sh EMBED_CPIO_GZ) so the aboot-direct boot is fully
++		 * self-contained.  Under lk2nd, ATAG_INITRD2 still delivers lk2nd's own
++		 * ramdisk at runtime (overrides/adds to the baked one) -- unaffected.
++		 */
++	};
++
++	/*
++	 * Real DRAM map read from the running vendor Android (/proc/iomem):
++	 *   80000000-879fffff  System RAM (122 MiB, below the secure hole)
++	 *   87a00000-8dcfffff  secure carveouts (tz/rmtfs/smem/mpss/wcnss/mba)
++	 *   8da00000-ffffefff  System RAM (~1830 MiB)
++	 * MemTotal ~1.84 GiB. We declare ONE bank spanning 0x80000000..0xfffff000;
++	 * the dtsi reserved-memory no-map regions (0x87a00000..0x8dd00000, verified
++	 * contiguous) carve out the secure hole. The bootloader leaves the DTSI
++	 * memory reg at size 0 (it passes a QCDT, not ATAGs), so we MUST set it.
++	 */
++	memory@80000000 {
++		device_type = "memory";
++		reg = <0x80000000 0x7ffff000>;
++	};
++
++	gpio-keys {
++		compatible = "gpio-keys";
++		pinctrl-0 = <&gpio_keys_default>;
++		pinctrl-names = "default";
++
++		button-power {
++			label = "Power";
++			gpios = <&tlmm 90 GPIO_ACTIVE_LOW>;
++			linux,code = <KEY_POWER>;
++		};
++	};
++
++	/* HDMI output behind the ADV7533 DSI->HDMI bridge (720p). */
++	hdmi-connector {
++		compatible = "hdmi-connector";
++		type = "a";
++
++		port {
++			hdmi_con: endpoint {
++				remote-endpoint = <&adv7533_out>;
++			};
++		};
++	};
++};
++
++/*
++ * Display: MDP3 -> DSI0 -> ADV7533 (I2C 0x39 on blsp_i2c4 / i2c@78b8000)
++ * -> HDMI. The bootloader (lk2nd) already brings the ADV7533 up at 720p, so we
++ * leave its power-down/switch GPIOs untouched and only wire the data path + IRQ.
++ */
++/*
++ * HACK(atv329q) §13.7: wire the MDSS scanout bandwidth path through the
++ * interconnect framework.  Without an icc vote the NoC/BIMC stay at the
++ * bootloader default and the MDP3 DMA_P fetch from DRAM is starved ->
++ * continuous LCDC_UNDERFLOW (black), especially on the LK handover where the
++ * inherited TG runs.  Provider nodes (RPM-managed BIMC/PCNOC/SNOC, addresses
++ * shared with msm8916); the mdp3 driver votes MASTER_MDP_PORT0 -> SLAVE_EBI_CH0.
++ */
++&soc {
++	bimc: interconnect@400000 {
++		compatible = "qcom,msm8909-bimc";
++		reg = <0x00400000 0x62000>;
++		#interconnect-cells = <1>;
++	};
++
++	pcnoc: interconnect@500000 {
++		compatible = "qcom,msm8909-pcnoc";
++		reg = <0x00500000 0x11000>;
++		#interconnect-cells = <1>;
++	};
++
++	snoc: interconnect@580000 {
++		compatible = "qcom,msm8909-snoc";
++		reg = <0x00580000 0x14000>;
++		#interconnect-cells = <1>;
++	};
++};
++
++&mdp {
++	status = "okay";
++	interconnects = <&snoc MAS_MDP &bimc SLV_EBI>;
++	interconnect-names = "mdp0-mem";
++};
++
++&mdss_dsi0 {
++	vdda-supply = <&pm8909_l2>;	/* 1.2 V */
++	vddio-supply = <&pm8909_l6>;	/* 1.8 V */
++	status = "okay";
++};
++
++&mdss_dsi0_phy {
++	vddio-supply = <&pm8909_l6>;	/* 1.8 V */
++	status = "okay";
++};
++
++&mdss_dsi0_out {
++	data-lanes = <0 1 2 3>;
++	remote-endpoint = <&adv7533_in>;
++};
++
++&blsp_i2c4 {
++	status = "okay";
++
++	adv_bridge: hdmi@39 {
++		compatible = "adi,adv7533";
++		reg = <0x39>;
++
++		interrupt-parent = <&tlmm>;
++		interrupts = <31 IRQ_TYPE_EDGE_FALLING>;
++
++		/*
++		 * The board wires only 3 DSI data lanes to the ADV7533 (vendor
++		 * DTS: lane-0/1/2-state only; LK panel config: num_of_lanes=3;
++		 * confirmed on silicon: lk2nd runs with DSI_CTRL=0x173, DLN3
++		 * off).  With 4 lanes the DSI video engine drains pixels faster
++		 * than the MDP3 TG produces them (non-burst link rate is tied
++		 * to lane count) -> continuous MDP3 LCDC_UNDERFLOW + all-lane
++		 * HS FIFO underflow, black screen.
++		 */
++		adi,dsi-lanes = <3>;
++
++		pinctrl-names = "default";
++		pinctrl-0 = <&adv7533_int_default>;
++
++		ports {
++			#address-cells = <1>;
++			#size-cells = <0>;
++
++			port@0 {
++				reg = <0>;
++				adv7533_in: endpoint {
++					remote-endpoint = <&mdss_dsi0_out>;
++				};
++			};
++
++			port@1 {
++				reg = <1>;
++				adv7533_out: endpoint {
++					remote-endpoint = <&hdmi_con>;
++				};
++			};
++		};
++	};
++};
++
++&blsp_uart1 {
++	status = "okay";
++};
++
++/* eMMC */
++&sdhc_1 {
++	vmmc-supply = <&pm8909_l8>;
++	vqmmc-supply = <&pm8909_l5>;
++	status = "okay";
++};
++
++/* WiFi: WCNSS/Pronto + IRIS (wcn3620) -> wcn36xx. Network channel independent
++ * of the (non-probing) USB controller. */
++&wcnss {
++	status = "okay";
++};
++
++&wcnss_iris {
++	compatible = "qcom,wcn3620";
++};
++
++/* Bluetooth: WCNSS hosts BT on the same Pronto core as WiFi -> btqcomsmd bridges
++ * HCI over the WCNSS_CTRL SMD channel (qcom,wcnss-bt node is in the .dtsi). The
++ * WCNSS has no persistent BD address storage, so supply a fixed (locally
++ * administered) one via the firmware property. Bytes are LITTLE-ENDIAN, i.e.
++ * reversed vs the displayed address 02:00:E3:9B:95:CA. */
++&wcnss_bt {
++	local-bd-address = [ ca 95 9b e3 00 02 ];
++};
++
++/* USB OTG (micro-USB = device for adb/gadget ; USB-A = host when ID floats) */
++&usb {
++	/*
++	 * HACK(atv329q ÉTAPE 2): force HOST.  For the autonomous deliverable
++	 * (boots from aboot, no Mac/NCM gadget needed) host mode drives the USB-A
++	 * port: a USB keyboard (interactive HDMI shell) AND the internal ASIX
++	 * AX88772C RJ45 (eth0 -> reliable LAN SSH, independent of the flaky screen
++	 * and WiFi).  fastboot boot still works (that's aboot, not this kernel).
++	 * Was "peripheral" (for the old micro-USB NCM channel to the Mac).
++	 */
++	dr_mode = "host";
++	status = "okay";
++};
++
++&usb_hs_phy {
++	/*
++	 * HACK(atv329q ÉTAPE 2): NO extcon.  extcon_get_edev_by_phandle(pm8909_charger)
++	 * returns -EPROBE_DEFER forever if the charger extcon never registers, and the
++	 * phy driver aborts before phy_create -> devm_phy_get("usb-phy") defers forever
++	 * -> USB bus never comes up.  Host mode doesn't need charger-VBUS detection, so
++	 * drop the extcon: the phy then gets -ENODEV -> vbus_edev=NULL -> probe finishes
++	 * -> phy provider registered -> ci_hdrc host comes up.
++	 */
++	/*
++	 * HACK(atv329q ÉTAPE 2): the qcom,usb-hs-phy driver REQUIRES v1p8 + v3p3
++	 * regulators; without them phy probe fails -> ci_hdrc never brings up the
++	 * USB bus (no root hub, no udc, no eth0, no keyboard).  This was why the
++	 * mainline USB never worked (host OR gadget).  Supplies taken from the
++	 * vendor MSM8909 dtb (usb@78d9000: HSUSB_1p8 = pm8909_l7 [1.8V],
++	 * HSUSB_3p3 = pm8909_l13 [3.075V]) -- same mapping as msm8916-pm8916.
++	 */
++	v1p8-supply = <&pm8909_l7>;
++	v3p3-supply = <&pm8909_l13>;
++};
++
++&smd_rpm_regulators {
++	s2 { regulator-min-microvolt = <1850000>; regulator-max-microvolt = <1850000>; };
++	l1 { regulator-min-microvolt = <1000000>; regulator-max-microvolt = <1000000>; };
++	l2 { regulator-min-microvolt = <1200000>; regulator-max-microvolt = <1200000>; };
++	l4 { regulator-min-microvolt = <1800000>; regulator-max-microvolt = <1800000>; };
++	l5 { regulator-min-microvolt = <1800000>; regulator-max-microvolt = <1800000>; };
++	l6 { regulator-min-microvolt = <1800000>; regulator-max-microvolt = <1800000>; };
++	l7 { regulator-min-microvolt = <1800000>; regulator-max-microvolt = <1800000>; };
++	l8 { regulator-min-microvolt = <2850000>; regulator-max-microvolt = <2900000>; };
++	l9 { regulator-min-microvolt = <3000000>; regulator-max-microvolt = <3300000>; };
++	l10 { regulator-min-microvolt = <1225000>; regulator-max-microvolt = <1300000>; };
++	l11 { regulator-min-microvolt = <1800000>; regulator-max-microvolt = <2950000>;
++	      regulator-system-load = <200000>; regulator-allow-set-load; };
++	l12 { regulator-min-microvolt = <1800000>; regulator-max-microvolt = <2950000>; };
++	l13 { regulator-min-microvolt = <3075000>; regulator-max-microvolt = <3075000>; };
++	l14 { regulator-min-microvolt = <1800000>; regulator-max-microvolt = <3000000>; };
++	l15 { regulator-min-microvolt = <1800000>; regulator-max-microvolt = <3000000>; };
++	l17 { regulator-min-microvolt = <2850000>; regulator-max-microvolt = <2850000>; };
++	l18 { regulator-min-microvolt = <2700000>; regulator-max-microvolt = <2700000>; };
++};
++
++&tlmm {
++	gpio_keys_default: gpio-keys-default-state {
++		pins = "gpio90";
++		function = "gpio";
++		drive-strength = <2>;
++		bias-pull-up;
++	};
++
++	/* ADV7533 interrupt line (vendor: irq-gpio = gpio31). */
++	adv7533_int_default: adv7533-int-default-state {
++		pins = "gpio31";
++		function = "gpio";
++		drive-strength = <2>;
++		bias-pull-up;
++	};
++
++	/*
++	 * HDMI switch (vendor: adv7533,switch-gpio = gpio33, output high).
++	 * Gates the HDMI connector path (incl. DDC): with the pin low the
++	 * EDID reads all zeroes and the panel stays dark even with a fully
++	 * working DSI link.  Hog it high at boot.
++	 */
++	hdmi-switch-hog {
++		gpio-hog;
++		gpios = <33 GPIO_ACTIVE_HIGH>;
++		output-high;
++		line-name = "adv7533-hdmi-switch";
++	};
++
++	/*
++	 * HACK(atv329q ÉTAPE 2): on-board USB hub + mux behind the single OTG port.
++	 * The vendor msm_otg drives these (qcom,hub-reset-gpio=26, sw-sel-gpio=27,
++	 * usbid-gpio=28); mainline chipidea doesn't.  Empirically (init-usbsweep):
++	 * hub-reset(26)=HIGH releases the Genesys hub, sw-sel(27)=HIGH routes the OTG
++	 * D+/D- to the hub (USB-A + internal ASIX AX88772B RJ45), instead of the
++	 * micro-USB.  With both hogged high the hub enumerates -> USB keyboard
++	 * (/dev/input) + eth0 (reliable LAN SSH).  Verified on silicon: sw-sel=1 +
++	 * hub-reset=1 -> "USB2.0 Hub 4 ports" + AX88772B(0b95:772b) + Dell kbd(413c:2106).
++	 */
++	usb-hub-reset-hog {
++		gpio-hog;
++		gpios = <26 GPIO_ACTIVE_HIGH>;
++		output-high;
++		line-name = "usb-hub-reset";
++	};
++
++	usb-sw-sel-hog {
++		gpio-hog;
++		gpios = <27 GPIO_ACTIVE_HIGH>;
++		output-high;
++		line-name = "usb-sw-sel";
++	};
++};
+diff --git a/arch/arm/boot/dts/qcom/qcom-msm8909.dtsi b/arch/arm/boot/dts/qcom/qcom-msm8909.dtsi
+index 54732effd..67d865323 100644
+--- a/arch/arm/boot/dts/qcom/qcom-msm8909.dtsi
++++ b/arch/arm/boot/dts/qcom/qcom-msm8909.dtsi
+@@ -3,6 +3,7 @@
+  * Copyright (c) 2014-2019, The Linux Foundation. All rights reserved.
+  */
+ 
++#include <dt-bindings/clock/qcom,dsi-phy-28nm.h>
+ #include <dt-bindings/clock/qcom,gcc-msm8909.h>
+ #include <dt-bindings/clock/qcom,rpmcc.h>
+ #include <dt-bindings/gpio/gpio.h>
+@@ -815,7 +816,9 @@ gcc: clock-controller@1800000 {
+ 			#clock-cells = <1>;
+ 			#reset-cells = <1>;
+ 			#power-domain-cells = <1>;
+-			clocks = <&xo_board>, <&sleep_clk>, <0>, <0>;
++			clocks = <&xo_board>, <&sleep_clk>,
++				 <&mdss_dsi0_phy DSI_PIXEL_PLL_CLK>,
++				 <&mdss_dsi0_phy DSI_BYTE_PLL_CLK>;
+ 			clock-names = "xo", "sleep_clk", "dsi0pll", "dsi0pllbyte";
+ 		};
+ 
+@@ -830,6 +833,134 @@ tcsr: syscon@1937000 {
+ 			reg = <0x01937000 0x30000>;
+ 		};
+ 
++		/*
++		 * Display: msm8909 has an MDP3 (single-pipe controller, NOT the
++		 * mdss/MDP5 hierarchy of msm8916) feeding a standard 6G DSI ctrl
++		 * + 28nm-lp PHY. The MDP3 is a direct DRM master (like MDP4) and
++		 * there is no display IOMMU (scanout from CMA). The DSI ctrl has
++		 * its own GIC line (vendor: qcom,dsi-irq-line, SPI 80), so no
++		 * mdss interrupt demuxer is needed. Each node carries the MDSS
++		 * GDSC power-domain since there is no wrapper to inherit it from.
++		 * Disabled by default; a board that wires up a panel/bridge
++		 * enables &mdp and the sub-nodes.
++		 */
++		mdp: display-controller@1a00000 {
++			compatible = "qcom,mdss_mdp3";
++			reg = <0x01a00000 0x100000>,
++			      <0x01ab0000 0x3000>;
++			reg-names = "mdp_phys", "vbif_phys";
++
++			interrupts = <GIC_SPI 72 IRQ_TYPE_LEVEL_HIGH>;
++
++			clocks = <&gcc GCC_MDSS_AHB_CLK>,
++				 <&gcc GCC_MDSS_AXI_CLK>,
++				 <&gcc GCC_MDSS_MDP_CLK>,
++				 <&gcc GCC_MDSS_VSYNC_CLK>;
++			clock-names = "iface",
++				      "bus",
++				      "core",
++				      "vsync";
++
++			power-domains = <&gcc MDSS_GDSC>;
++
++			resets = <&gcc GCC_MDSS_BCR>;
++
++			status = "disabled";
++
++			ports {
++				#address-cells = <1>;
++				#size-cells = <0>;
++
++				port@0 {
++					reg = <0>;
++					mdp3_dma_p_out: endpoint {
++						remote-endpoint = <&mdss_dsi0_in>;
++					};
++				};
++			};
++		};
++
++		mdss_dsi0: dsi@1ac8000 {
++			compatible = "qcom,msm8916-dsi-ctrl",
++				     "qcom,mdss-dsi-ctrl";
++			reg = <0x01ac8000 0x25c>;	/* msm8909 DSI ctrl (vendor) */
++			reg-names = "dsi_ctrl";
++
++			interrupts = <GIC_SPI 80 IRQ_TYPE_LEVEL_HIGH>;
++
++			assigned-clocks = <&gcc BYTE0_CLK_SRC>,
++					  <&gcc PCLK0_CLK_SRC>;
++			assigned-clock-parents = <&mdss_dsi0_phy DSI_BYTE_PLL_CLK>,
++						 <&mdss_dsi0_phy DSI_PIXEL_PLL_CLK>;
++
++			clocks = <&gcc GCC_MDSS_MDP_CLK>,
++				 <&gcc GCC_MDSS_AHB_CLK>,
++				 <&gcc GCC_MDSS_AXI_CLK>,
++				 <&gcc GCC_MDSS_BYTE0_CLK>,
++				 <&gcc GCC_MDSS_PCLK0_CLK>,
++				 <&gcc GCC_MDSS_ESC0_CLK>;
++			clock-names = "mdp_core",
++				      "iface",
++				      "bus",
++				      "byte",
++				      "pixel",
++				      "core";
++			phys = <&mdss_dsi0_phy>;
++
++			power-domains = <&gcc MDSS_GDSC>;
++
++			status = "disabled";
++
++			#address-cells = <1>;
++			#size-cells = <0>;
++
++			ports {
++				#address-cells = <1>;
++				#size-cells = <0>;
++
++				port@0 {
++					reg = <0>;
++					mdss_dsi0_in: endpoint {
++						remote-endpoint = <&mdp3_dma_p_out>;
++					};
++				};
++
++				port@1 {
++					reg = <1>;
++					mdss_dsi0_out: endpoint {
++					};
++				};
++			};
++		};
++
++		mdss_dsi0_phy: phy@1ac8300 {
++			compatible = "qcom,dsi-phy-28nm-lp";
++			reg = <0x01ac8300 0xd4>,	/* msm8909 DSI PLL/PHY (vendor) */
++			      <0x01ac8500 0x280>,
++			      <0x01ac8780 0x30>;
++			reg-names = "dsi_pll",
++				    "dsi_phy",
++				    "dsi_phy_regulator";
++
++			#clock-cells = <1>;
++			#phy-cells = <0>;
++
++			/*
++			 * The PHY analog rails run off the internal LDO, not
++			 * DCDC (vendor DTS: qcom,regulator-ldo-mode; confirmed
++			 * on silicon: LK leaves LDO_CNTRL = 0x05).
++			 */
++			qcom,dsi-phy-regulator-ldo-mode;
++
++			clocks = <&gcc GCC_MDSS_AHB_CLK>,
++				 <&xo_board>;
++			clock-names = "iface", "ref";
++
++			power-domains = <&gcc MDSS_GDSC>;
++
++			status = "disabled";
++		};
++
+ 		spmi_bus: spmi@200f000 {
+ 			compatible = "qcom,spmi-pmic-arb";
+ 			reg = <0x0200f000 0x001000>,

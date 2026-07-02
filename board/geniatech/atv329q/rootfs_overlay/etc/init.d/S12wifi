@@ -1,0 +1,49 @@
+#!/bin/sh
+# Best-effort WiFi (wcn36xx / WCNSS). The WCNSS remoteproc auto-boots at probe
+# (~2s) BEFORE the eMMC rootfs is mounted, so its firmware load fails (-2) and
+# wlan0 never appears. Once / is mounted (firmware present) we (re)start the
+# remoteproc, wait for wlan0, then associate + DHCP. Non-blocking, non-fatal.
+# NOTE: only touches wlan0 -- never kills eth0's DHCP client.
+case "$1" in
+  start)
+    # No WiFi config (e.g. a fresh clone -> wpa_supplicant.conf is git-ignored)?
+    # Skip cleanly; eth0 / SSH are unaffected.
+    [ -f /etc/wpa_supplicant.conf ] || exit 0
+    (
+      # 1) boot the WCNSS remoteproc (firmware is on the rootfs now)
+      for r in /sys/class/remoteproc/remoteproc*; do
+        [ "$(cat "$r/firmware" 2>/dev/null)" = "wcnss.mdt" ] || continue
+        [ "$(cat "$r/state" 2>/dev/null)" != "running" ] && echo start > "$r/state" 2>/dev/null
+      done
+      # 2) wait for wlan0 (WCNSS boot + wcn36xx probe take a few seconds)
+      for i in $(seq 1 30); do [ -d /sys/class/net/wlan0 ] && break; sleep 1; done
+      [ -d /sys/class/net/wlan0 ] || exit 0
+      # 2b) wcn36xx exposes a zero MAC (NV has no valid one) -> "ip link set up"
+      #     fails "Cannot assign requested address". Give wlan0 a stable
+      #     locally-administered MAC derived from eth0 (unique per board).
+      if [ "$(cat /sys/class/net/wlan0/address 2>/dev/null)" = "00:00:00:00:00:00" ]; then
+        eth=$(cat /sys/class/net/eth0/address 2>/dev/null)
+        if [ -n "$eth" ] && [ "$eth" != "00:00:00:00:00:00" ]; then
+          mac="$(printf '%02x' $(( 0x${eth%%:*} | 2 ))):${eth#*:}"
+        else
+          mac="02:00:5e:a3:29:71"
+        fi
+        ip link set wlan0 address "$mac" 2>/dev/null
+      fi
+      # 3) associate (nl80211 backend) + DHCP on wlan0 only
+      ip link set wlan0 up 2>/dev/null
+      iw reg set FR 2>/dev/null
+      wpa_supplicant -B -i wlan0 -D nl80211 -c /etc/wpa_supplicant.conf >/dev/null 2>&1
+      for i in $(seq 1 20); do
+        iw wlan0 link 2>/dev/null | grep -qi "Connected to" && break
+        sleep 1
+      done
+      udhcpc -b -i wlan0 -x hostname:atv329q >/dev/null 2>&1 &
+    ) &
+    ;;
+  stop)
+    # only wlan0's clients (match the interface, don't kill eth0's udhcpc)
+    kill "$(cat /var/run/wpa_supplicant/wlan0.pid 2>/dev/null)" 2>/dev/null
+    pkill -f "udhcpc.*wlan0" 2>/dev/null ;;
+  restart|reload) "$0" stop; sleep 1; "$0" start ;;
+esac

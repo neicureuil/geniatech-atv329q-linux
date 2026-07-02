@@ -1,0 +1,73 @@
+# Buildroot defconfig for the Geniatech atv329q (Qualcomm MSM8909, Cortex-A7)
+# Produces: kernel zImage + atv329q DTB, an ext4 rootfs (for the eMMC "system"
+# partition, mmcblk0p22), and (via post-image.sh) an aboot boot.img + QCDT.
+
+# Architecture: MSM8909 = quad Cortex-A7, ARMv7 32-bit, NEON/VFPv4, hard-float.
+BR2_arm=y
+BR2_cortex_a7=y
+BR2_ARM_FPU_NEON_VFPV4=y
+
+# Toolchain (Buildroot internal, glibc for broad package compatibility).
+BR2_TOOLCHAIN_BUILDROOT_GLIBC=y
+BR2_TOOLCHAIN_BUILDROOT_CXX=y
+
+# Init/system: BusyBox init, DHCP on eth0 (the internal ASIX RJ45 via the USB hub).
+BR2_TARGET_GENERIC_HOSTNAME="atv329q"
+BR2_TARGET_GENERIC_ISSUE="Geniatech atv329q - mainline Linux (Buildroot)"
+BR2_TARGET_GENERIC_ROOT_PASSWD="alpine"
+BR2_SYSTEM_DHCP="eth0"
+BR2_SYSTEM_BIND_MOUNT_DEV_TYPE_DEVTMPFS=y
+
+# Rootfs overlay (network, wpa_supplicant conf, screen DPMS helper).
+BR2_ROOTFS_OVERLAY="$(BR2_EXTERNAL_ATV329Q_PATH)/board/geniatech/atv329q/rootfs_overlay"
+
+# Kernel: msm8916-mainline tree pinned at the BSP base + our atv329q patch,
+# with our full .config, building zImage + the atv329q DTB.
+BR2_LINUX_KERNEL=y
+BR2_LINUX_KERNEL_CUSTOM_GIT=y
+BR2_LINUX_KERNEL_CUSTOM_REPO_URL="https://github.com/msm8916-mainline/linux.git"
+BR2_LINUX_KERNEL_CUSTOM_REPO_VERSION="ea3a5c52f8f62f6464b6cdc06b700f0704f1c04a"
+BR2_LINUX_KERNEL_PATCH="$(BR2_EXTERNAL_ATV329Q_PATH)/board/geniatech/atv329q/patches/linux"
+BR2_LINUX_KERNEL_USE_CUSTOM_CONFIG=y
+BR2_LINUX_KERNEL_CUSTOM_CONFIG_FILE="$(BR2_EXTERNAL_ATV329Q_PATH)/board/geniatech/atv329q/linux.config"
+BR2_LINUX_KERNEL_ZIMAGE=y
+BR2_LINUX_KERNEL_DTS_SUPPORT=y
+BR2_LINUX_KERNEL_INTREE_DTS_NAME="qcom/qcom-msm8909-geniatech-atv329q"
+BR2_LINUX_KERNEL_NEEDS_HOST_OPENSSL=y
+
+# Rootfs: ext4, sized to fill the eMMC "system" partition (1.2 GiB, mmcblk0p22).
+BR2_TARGET_ROOTFS_EXT2=y
+BR2_TARGET_ROOTFS_EXT2_4=y
+BR2_TARGET_ROOTFS_EXT2_SIZE="1200M"
+
+# ccache: speeds up incremental rebuilds (kept on a persistent docker volume).
+BR2_CCACHE=y
+BR2_CCACHE_DIR="/ccache"
+
+# e2fsprogs: mkfs.ext4/resize2fs on target (format the big userdata partition
+# for /data, resize filesystems).
+BR2_PACKAGE_E2FSPROGS=y
+BR2_PACKAGE_E2FSPROGS_RESIZE2FS=y
+# no initramfs/cpio: rootfs is mounted from the eMMC partition (root=/dev/mmcblk0p22)
+# BR2_TARGET_ROOTFS_CPIO is not set
+
+# Networking / access.
+BR2_PACKAGE_DROPBEAR=y
+BR2_PACKAGE_WPA_SUPPLICANT=y
+BR2_PACKAGE_WPA_SUPPLICANT_NL80211=y
+BR2_PACKAGE_WPA_SUPPLICANT_CLI=y
+BR2_PACKAGE_IW=y
+BR2_PACKAGE_WIRELESS_REGDB=y
+
+# i2c-tools: i2cget to read the ADV7533 lock oracle (0x3e) for the screen helper.
+BR2_PACKAGE_I2C_TOOLS=y
+
+# Handy userland.
+BR2_PACKAGE_HTOP=y
+BR2_PACKAGE_NANO=y
+BR2_PACKAGE_UTIL_LINUX=y
+BR2_PACKAGE_UTIL_LINUX_BINARIES=y
+
+# Build the aboot boot.img + QCDT after the images are ready.
+BR2_ROOTFS_POST_IMAGE_SCRIPT="$(BR2_EXTERNAL_ATV329Q_PATH)/board/geniatech/atv329q/post-image.sh"
+BR2_ROOTFS_POST_SCRIPT_ARGS=""

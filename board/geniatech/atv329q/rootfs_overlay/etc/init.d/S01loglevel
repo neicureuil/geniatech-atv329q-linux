@@ -1,0 +1,11 @@
+#!/bin/sh
+# Quiet the console. The HDMI framebuffer console (tty0) also carries the login
+# getty, but kernel printk messages -- especially wlan0 / mac80211 association
+# spam once S12wifi runs -- keep printing over the login prompt. Lower the
+# console_loglevel so only KERN_ERR (3) and above reach the console; everything
+# is still recorded and visible via `dmesg`. Early (S01) so it applies before
+# WiFi comes up.
+case "$1" in
+  start) echo 3 > /proc/sys/kernel/printk 2>/dev/null ;;
+  stop)  : ;;
+esac

@@ -1,0 +1,1 @@
+console=tty0 console=ttyMSM0,115200 video=HDMI-A-1:1280x720@60 root=/dev/mmcblk0p22 rootwait rw panic=5

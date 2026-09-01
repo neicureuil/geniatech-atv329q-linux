@@ -1,0 +1,23 @@
+config BR2_PACKAGE_DOCKER_BIN
+	bool "docker-bin (official static armhf binaries)"
+	depends on BR2_arm
+	default y
+	select BR2_PACKAGE_IPTABLES         # container NAT / port publishing
+	select BR2_PACKAGE_CA_CERTIFICATES  # pull images over HTTPS
+	select BR2_PACKAGE_CGROUPFS_MOUNT   # mounts the cgroup hierarchy (S30cgroupfs)
+	select BR2_PACKAGE_IPROUTE2         # `ip`, for container networking
+	help
+	  Install Docker from the official prebuilt STATIC binaries for armhf
+	  (dockerd, docker, containerd, runc, ...). They are statically linked
+	  (no libc dependency), so no Go cross-toolchain is compiled -- unlike
+	  the Buildroot docker-engine package, this builds on any host arch.
+
+	  The kernel side comes with the package: enabling it merges
+	  linux-docker.config (namespaces, cgroups incl. the v1 memory/cpuset
+	  controllers, overlayfs, bridge/veth/vxlan, netfilter NAT) on top of
+	  linux.config, so the engine and the kernel can't drift apart.
+
+	  Note: the kernel differs between on and off, so run
+	  `./build.sh kernel` after flipping this.
+
+	  https://docs.docker.com/engine/install/binaries/

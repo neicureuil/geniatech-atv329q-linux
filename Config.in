@@ -1,1 +1,6 @@
-# No external packages yet.
+menu "atv329q board packages"
+
+source "$BR2_EXTERNAL_ATV329Q_PATH/package/atv329q-screen/Config.in"
+source "$BR2_EXTERNAL_ATV329Q_PATH/package/docker-bin/Config.in"
+
+endmenu

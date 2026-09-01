@@ -59,14 +59,64 @@ BR2_PACKAGE_WPA_SUPPLICANT_CLI=y
 BR2_PACKAGE_IW=y
 BR2_PACKAGE_WIRELESS_REGDB=y
 
-# i2c-tools: i2cget to read the ADV7533 lock oracle (0x3e) for the screen helper.
-BR2_PACKAGE_I2C_TOOLS=y
+# --- Ecran / sortie HDMI (package atv329q-screen, ACTIVE par defaut) ---
+# Chaine MDP3 -> DSI -> ADV7533 : le kernel (DRM/KMS + fbdev + fbcon) est deja
+# dans linux.config ; le package fournit le userland (S15screen, getty tty0) et,
+# quand il est DESACTIVE, le fragment linux-noscreen.config qui retire DRM/FB.
+# Image HEADLESS : remplacer la ligne ci-dessous par
+# "# BR2_PACKAGE_ATV329Q_SCREEN is not set" (ou build ponctuel :
+# ./build.sh noscreen), puis ./build.sh kernel (le kernel change).
+BR2_PACKAGE_ATV329Q_SCREEN=y
 
 # Handy userland.
 BR2_PACKAGE_HTOP=y
 BR2_PACKAGE_NANO=y
 BR2_PACKAGE_UTIL_LINUX=y
 BR2_PACKAGE_UTIL_LINUX_BINARIES=y
+
+# --- Bluetooth (WCNSS, meme coeur radio que le WiFi, via btqcomsmd) ---
+# Cote kernel linux.config a deja BT=y / BT_QCOMSMD=y, plus RFCOMM, BNEP, HIDP,
+# UHID et HIDRAW (claviers / souris / manettes Bluetooth).
+# Cote userland: BlueZ 5 (bluetoothd + bluetoothctl + btmon + les outils hci*).
+# bluez5_utils tire dbus et libglib2 tout seul; les init scripts S30dbus puis
+# S40bluetoothd viennent avec les paquets. L'adaptateur hci0 n'apparait qu'une
+# fois le remoteproc WCNSS demarre -> voir l'overlay S10wcnss.
+BR2_PACKAGE_BLUEZ5_UTILS=y
+BR2_PACKAGE_BLUEZ5_UTILS_CLIENT=y
+BR2_PACKAGE_BLUEZ5_UTILS_MONITOR=y
+BR2_PACKAGE_BLUEZ5_UTILS_TOOLS=y
+BR2_PACKAGE_BLUEZ5_UTILS_DEPRECATED=y
+BR2_PACKAGE_BLUEZ5_UTILS_PLUGINS_HID=y
+
+# --- SFTP ---
+# dropbear annonce deja le subsystem sftp (DROPBEAR_SFTPSERVER=1, chemin
+# /usr/libexec/sftp-server) mais ne fournit pas le binaire: on prend celui
+# d'OpenSSH. post-build.sh supprime ensuite sshd et son init S50sshd pour qu'il
+# ne se batte pas avec dropbear sur le port 22 (on garde le canal SSH eprouve).
+BR2_PACKAGE_OPENSSH=y
+BR2_PACKAGE_OPENSSH_SERVER=y
+# BR2_PACKAGE_OPENSSH_CLIENT is not set
+# BR2_PACKAGE_OPENSSH_KEY_UTILS is not set
+
+# --- Docker (package docker-bin, ACTIVE par defaut) ---
+# Binaires statiques officiels armhf (pas de compilation Go). Le package select
+# iptables/ca-certificates/cgroupfs-mount/iproute2 et tire son fragment kernel
+# linux-docker.config (namespaces, cgroups, overlayfs, netfilter).
+# Image SANS docker : remplacer la ligne ci-dessous par
+# "# BR2_PACKAGE_DOCKER_BIN is not set" (ou build ponctuel : ./build.sh
+# nodocker), puis ./build.sh kernel (le kernel change).
+BR2_PACKAGE_DOCKER_BIN=y
+
+# --- NTP (chrony) ---
+# Pas de RTC a pile : l'horloge demarre en 1970 -> TLS casse (docker pull :
+# "certificate is not yet valid"). chrony discipline l'horloge en continu ;
+# /etc/chrony.conf (overlay) autorise le step illimite (makestep 1.0 -1).
+# S45timesync fait un premier calage synchrone (chronyd -q) avant dockerd (S60),
+# puis le paquet demarre le demon via son S49chrony.
+BR2_PACKAGE_CHRONY=y
+
+# Nettoyage du rootfs avant la creation de l'image (voir post-build.sh).
+BR2_ROOTFS_POST_BUILD_SCRIPT="$(BR2_EXTERNAL_ATV329Q_PATH)/board/geniatech/atv329q/post-build.sh"
 
 # Build the aboot boot.img + QCDT after the images are ready.
 BR2_ROOTFS_POST_IMAGE_SCRIPT="$(BR2_EXTERNAL_ATV329Q_PATH)/board/geniatech/atv329q/post-image.sh"

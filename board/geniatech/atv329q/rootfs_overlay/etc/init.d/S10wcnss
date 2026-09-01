@@ -1,0 +1,25 @@
+#!/bin/sh
+# Boot the WCNSS remoteproc (the shared WiFi + Bluetooth radio core).
+#
+# The remoteproc auto-boots at probe (~2s into the kernel boot), BEFORE the eMMC
+# rootfs is mounted, so its firmware load fails (-2) and neither wlan0 nor hci0
+# ever appears.  Once / is mounted the firmware is there, so we just restart it.
+#
+# This used to live inside S12wifi, but S12wifi bails out early when there is no
+# /etc/wpa_supplicant.conf -- which also killed Bluetooth on a box with no WiFi
+# config.  The radio boot belongs here; S12wifi's own (idempotent) restart is
+# harmless.  Bluetooth then comes up on its own: btqcomsmd binds when WCNSS is
+# running, hci0 appears, and bluetoothd (S40) powers it on.
+case "$1" in
+  start)
+    (
+      for r in /sys/class/remoteproc/remoteproc*; do
+        [ "$(cat "$r/firmware" 2>/dev/null)" = "wcnss.mdt" ] || continue
+        [ "$(cat "$r/state" 2>/dev/null)" != "running" ] && echo start > "$r/state" 2>/dev/null
+      done
+    ) &
+    ;;
+  stop)
+    ;;
+  restart|reload) "$0" stop; "$0" start ;;
+esac

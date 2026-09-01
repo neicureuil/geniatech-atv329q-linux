@@ -1,0 +1,23 @@
+config BR2_PACKAGE_ATV329Q_SCREEN
+	bool "atv329q display (MDP3 -> DSI -> ADV7533 HDMI)"
+	default y
+	help
+	  Display support for the atv329q: the kernel side (DRM/KMS with fbdev
+	  emulation, framebuffer console, boot logo -- all already enabled in
+	  board/geniatech/atv329q/linux.config) plus the userland side:
+
+	    - /etc/init.d/S15screen, the oracle-gated DPMS re-arm helper (it
+	      reads the ADV7533 lock oracle with busybox's i2cget applet),
+	    - a getty on tty0, i.e. a login prompt on the HDMI screen.
+
+	  Disable for a headless box: the package then merges its
+	  linux-noscreen.config kernel fragment, which drops DRM/FB/fbcon/logo
+	  from the kernel, and installs none of the userland. Access stays over
+	  SSH (eth0/wlan0) and the serial console.
+
+	  The kernel patches (MDP3 driver, DSI, ADV7533, MDSS clock, device
+	  tree) are always applied -- they are the board's source of truth.
+	  This only controls whether the display is built and used.
+
+	  Note: the kernel differs between on and off, so run
+	  `./build.sh kernel` after flipping this.

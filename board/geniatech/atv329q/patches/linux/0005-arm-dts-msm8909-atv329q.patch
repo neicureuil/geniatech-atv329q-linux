@@ -348,7 +348,7 @@ index 000000000..34a180199
 +	};
 +};
 diff --git a/arch/arm/boot/dts/qcom/qcom-msm8909.dtsi b/arch/arm/boot/dts/qcom/qcom-msm8909.dtsi
-index 54732effd..67d865323 100644
+index 54732effd..e59598a07 100644
 --- a/arch/arm/boot/dts/qcom/qcom-msm8909.dtsi
 +++ b/arch/arm/boot/dts/qcom/qcom-msm8909.dtsi
 @@ -3,6 +3,7 @@
@@ -359,7 +359,44 @@ index 54732effd..67d865323 100644
  #include <dt-bindings/clock/qcom,gcc-msm8909.h>
  #include <dt-bindings/clock/qcom,rpmcc.h>
  #include <dt-bindings/gpio/gpio.h>
-@@ -815,7 +816,9 @@ gcc: clock-controller@1800000 {
+@@ -493,6 +494,36 @@ restart@4ab000 {
+ 			reg = <0x004ab000 0x4>;
+ 		};
+ 
++		/*
++		 * HACK(atv329q): MSM IMEM restart-reason cookie, so that
++		 * `reboot bootloader` / `reboot recovery` write the magic the
++		 * Qualcomm boot chain expects.  Offset and magics match the vendor
++		 * DT (qcom,msm-imem@8600000 / restart_reason@65c) and the upstream
++		 * msm8226/msm8974 imem nodes; syscon-reboot-mode writes the cookie
++		 * on reboot, then qcom,pshold resets.
++		 *
++		 * WARNING: this does NOT get you into fastboot on this board.
++		 * Measured 2026-08-31: writing 0x77665500 at 0x0860065c by hand
++		 * (devmem) and rebooting lands in Linux, and the cookie is still
++		 * there afterwards -- the vendor aboot never reads it (its binary
++		 * has no 0x77665500 constant; the only reboot channel it exposes is
++		 * the "boot-recovery" string in the misc partition).  Kept because
++		 * it is the correct, upstream-shaped description of the hardware and
++		 * costs nothing, but re-flashing this board still means EDL.
++		 */
++		imem: sram@8600000 {
++			compatible = "qcom,msm8909-imem", "syscon", "simple-mfd";
++			reg = <0x08600000 0x1000>;
++
++			reboot-mode {
++				compatible = "syscon-reboot-mode";
++				offset = <0x65c>;
++				mode-bootloader = <0x77665500>;
++				mode-normal = <0x77665501>;
++				mode-recovery = <0x77665502>;
++			};
++		};
++
+ 		tlmm: pinctrl@1000000 {
+ 			compatible = "qcom,msm8909-tlmm";
+ 			reg = <0x01000000 0x300000>;
+@@ -815,7 +846,9 @@ gcc: clock-controller@1800000 {
  			#clock-cells = <1>;
  			#reset-cells = <1>;
  			#power-domain-cells = <1>;
@@ -370,7 +407,7 @@ index 54732effd..67d865323 100644
  			clock-names = "xo", "sleep_clk", "dsi0pll", "dsi0pllbyte";
  		};
  
-@@ -830,6 +833,134 @@ tcsr: syscon@1937000 {
+@@ -830,6 +863,134 @@ tcsr: syscon@1937000 {
  			reg = <0x01937000 0x30000>;
  		};
  

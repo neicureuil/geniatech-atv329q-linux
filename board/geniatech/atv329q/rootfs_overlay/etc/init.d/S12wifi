@@ -32,6 +32,9 @@ case "$1" in
       fi
       # 3) associate (nl80211 backend) + DHCP on wlan0 only
       ip link set wlan0 up 2>/dev/null
+      # Disable power save: wcn36xx floods the log with "Can not enter BMPS!"
+      # (hal_enter_bmps err=1) retrying power-save forever. WiFi works either way.
+      iw dev wlan0 set power_save off 2>/dev/null
       iw reg set FR 2>/dev/null
       wpa_supplicant -B -i wlan0 -D nl80211 -c /etc/wpa_supplicant.conf >/dev/null 2>&1
       for i in $(seq 1 20); do

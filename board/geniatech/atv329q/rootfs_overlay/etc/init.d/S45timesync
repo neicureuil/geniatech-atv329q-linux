@@ -1,0 +1,27 @@
+#!/bin/sh
+# First clock sync of the boot, SYNCHRONOUS.
+#
+# The box has no battery-backed RTC: the clock starts at 1970, so TLS fails
+# ("certificate is not yet valid") and `docker pull` breaks. The chrony daemon
+# (S49chrony) disciplines the clock continuously, but it steps asynchronously --
+# dockerd (S60) could still start in 1970. So step the clock here first with a
+# one-shot `chronyd -q` (uses /etc/chrony.conf, exits once it has set the time),
+# and fall back to rdate (RFC 868) if NTP is unreachable. Non-fatal either way.
+case "$1" in
+  start)
+    printf "Syncing clock (NTP): "
+    mkdir -p /var/lib/chrony
+    chown chrony:chrony /var/lib/chrony 2>/dev/null
+    if chronyd -q -t 15 >/dev/null 2>&1; then
+      echo "OK ($(date))"
+    elif for s in time.nist.gov time-a-g.nist.gov time-b-g.nist.gov 129.6.15.28; do
+           rdate -s "$s" 2>/dev/null && break
+         done; then
+      echo "OK via rdate ($(date))"
+    else
+      echo "FAIL (clock left at $(date))"
+    fi
+    hwclock -w 2>/dev/null   # push to the RTC (harmless if there's no battery)
+    ;;
+  stop) : ;;
+esac

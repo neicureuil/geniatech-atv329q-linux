@@ -1,0 +1,2 @@
+# Locally computed (shasum -a 256 of the official docker-27.5.1.tgz armhf tarball)
+sha256  d1aac79d0ea25ab2d7bac56398959d70b4a3c34b90db91842c841f0d7faf36c3  docker-27.5.1.tgz

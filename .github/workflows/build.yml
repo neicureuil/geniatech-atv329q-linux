@@ -1,0 +1,203 @@
+name: build
+
+permissions:
+  contents: read
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  # No pull_request trigger: a full Buildroot build is far too expensive to run
+  # on every PR. Building a branch is done on demand -- pick it in the "Run
+  # workflow" dialog (available once this file is on the default branch).
+  workflow_dispatch:
+    inputs:
+      screen:
+        description: 'Include the atv329q-screen package (HDMI display)'
+        type: boolean
+        default: true
+      docker:
+        description: 'Include the docker-bin package (Docker engine)'
+        type: boolean
+        default: true
+
+# A superseded push should not keep burning a 60-minute runner.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Pinned in the README; the tree is only tested against this Buildroot.
+  BUILDROOT_REF: '2024.02.10'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # only to attach images to a tagged release
+    # Measured: 1h30 for a cold build (internal glibc toolchain + kernel +
+    # packages, empty dl/ and ccache). 150 leaves room for a slower runner or
+    # an expired cache while still killing a hung job in reasonable time.
+    timeout-minutes: 150
+
+    env:
+      # For anything other than a manual run, build the full default image.
+      SCREEN: ${{ github.event_name != 'workflow_dispatch' || inputs.screen }}
+      DOCKER: ${{ github.event_name != 'workflow_dispatch' || inputs.docker }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: atv329q
+
+      # A Buildroot build with an internal toolchain needs far more than the
+      # ~14 GB a stock runner leaves free.
+      - name: Reclaim runner disk space
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+          df -h /
+
+      # Same list as build.sh installs inside its Debian container, so the CI
+      # host and the local Docker build stay in step.
+      - name: Install host dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq build-essential file wget cpio unzip rsync \
+            bc python3 python3-dev libncurses-dev git bzip2 xz-utils libssl-dev \
+            flex bison gawk perl mtools
+
+      - name: Clone Buildroot ${{ env.BUILDROOT_REF }}
+        run: git clone --depth 1 --branch "$BUILDROOT_REF"
+             https://github.com/buildroot/buildroot.git buildroot
+
+      # Downloads are worth caching: the kernel alone is a full clone of the
+      # msm8916-mainline fork, which Buildroot stores as a tarball in dl/.
+      # Cache entries are immutable, hence the run_id suffix + restore-keys.
+      - name: Cache Buildroot downloads
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/dl
+          key: dl-${{ hashFiles('atv329q/configs/atv329q_defconfig') }}-${{ github.run_id }}
+          restore-keys: |
+            dl-${{ hashFiles('atv329q/configs/atv329q_defconfig') }}-
+            dl-
+
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/ccache
+          key: ccache-${{ github.run_id }}
+          restore-keys: ccache-
+
+      # Mirrors build.sh: the defconfig stays the source of truth, and a
+      # variant is built from a *copy* with the symbol turned off -- never by
+      # editing an already-generated .config, where everything the package
+      # selects would keep its value.
+      - name: Select the defconfig for this run
+        run: |
+          SRC="$GITHUB_WORKSPACE/atv329q/configs/atv329q_defconfig"
+          DST="$RUNNER_TEMP/atv329q_defconfig"
+          cp "$SRC" "$DST"
+          if [ "$DOCKER" != "true" ]; then
+            echo "building WITHOUT the docker-bin package"
+            sed -i 's/^BR2_PACKAGE_DOCKER_BIN=y/# BR2_PACKAGE_DOCKER_BIN is not set/' "$DST"
+          fi
+          if [ "$SCREEN" != "true" ]; then
+            echo "building HEADLESS (no atv329q-screen package)"
+            sed -i 's/^BR2_PACKAGE_ATV329Q_SCREEN=y/# BR2_PACKAGE_ATV329Q_SCREEN is not set/' "$DST"
+          fi
+          echo "DEFCONFIG_FILE=$DST" >> "$GITHUB_ENV"
+
+      # NOTE: `output/` is deliberately NOT cached. Buildroot keeps the
+      # extracted+patched kernel behind stamp files, so a rebuild on a reused
+      # output tree silently keeps the old kernel after a change to
+      # patches/linux/*.patch or linux.config -- the exact footgun the README
+      # warns about. Locally you answer it with `./build.sh kernel`; in CI
+      # nobody would notice, so every run builds from a clean tree instead.
+      #
+      # BR2_CCACHE_DIR is overridden here because the defconfig hardcodes
+      # "/ccache", which only exists inside build.sh's Docker container.
+      - name: Build
+        working-directory: buildroot
+        run: |
+          make O="$GITHUB_WORKSPACE/output" \
+               BR2_EXTERNAL="$GITHUB_WORKSPACE/atv329q" \
+               BR2_DL_DIR="$GITHUB_WORKSPACE/dl" \
+               BR2_DEFCONFIG="$DEFCONFIG_FILE" \
+               defconfig
+          make O="$GITHUB_WORKSPACE/output" \
+               BR2_DL_DIR="$GITHUB_WORKSPACE/dl" \
+               BR2_CCACHE_DIR="$GITHUB_WORKSPACE/ccache"
+
+      - name: Collect images
+        id: collect
+        run: |
+          set -eu
+          OUT="$GITHUB_WORKSPACE/images"
+          mkdir -p "$OUT"
+          for f in boot.img atv329q-qcdt.img rootfs.ext2 zImage \
+                   qcom-msm8909-geniatech-atv329q.dtb; do
+            src="$GITHUB_WORKSPACE/output/images/$f"
+            # Not `[ -f ] && cp`: under `set -e` a false test on the last
+            # iteration would abort the step.
+            if [ -f "$src" ]; then cp "$src" "$OUT/"; else echo "missing: $f"; fi
+          done
+          for required in boot.img atv329q-qcdt.img rootfs.ext2; do
+            [ -f "$OUT/$required" ] || {
+              echo "::error::$required was not produced by the build"; exit 1; }
+          done
+          cp "$GITHUB_WORKSPACE/output/.config" "$OUT/buildroot.config"
+          cp "$GITHUB_WORKSPACE/output/build/linux-"*/.config "$OUT/linux.config" || true
+
+          # boot.img must fit the 32 MiB `boot` partition (65536 sectors).
+          boot_sz=$(stat -c%s "$OUT/boot.img")
+          echo "boot.img: $boot_sz bytes of 33554432 available"
+          if [ "$boot_sz" -gt 33554432 ]; then
+            echo "::error::boot.img ($boot_sz bytes) exceeds the 32 MiB boot partition"
+            exit 1
+          fi
+
+          # rootfs.ext2 is a 1200 MiB mostly-empty image: compress before upload.
+          gzip -9 "$OUT/rootfs.ext2"
+
+          # Built outside $OUT first, otherwise `sha256sum *` would hash the
+          # manifest while it is still being written to.
+          {
+            echo "commit:    ${{ github.sha }}"
+            echo "ref:       ${{ github.ref }}"
+            echo "screen:    $SCREEN"
+            echo "docker:    $DOCKER"
+            echo "buildroot: $BUILDROOT_REF"
+            echo
+            echo "sha256:"
+            ( cd "$OUT" && sha256sum -- * )
+          } > "$RUNNER_TEMP/MANIFEST.txt"
+          mv "$RUNNER_TEMP/MANIFEST.txt" "$OUT/MANIFEST.txt"
+          cat "$OUT/MANIFEST.txt"
+
+          echo "name=atv329q-${GITHUB_SHA::8}-screen-$SCREEN-docker-$DOCKER" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.collect.outputs.name }}
+          path: images/
+          retention-days: 30
+          # rootfs is already gzipped; re-zipping it only costs time.
+          compression-level: 1
+
+      # Tagged builds also become a downloadable release, so flashing a fleet
+      # does not mean digging through workflow runs.
+      - name: Attach to the release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${GITHUB_REF#refs/tags/}"
+          # A pushed tag has no release yet unless one was made by hand.
+          gh release view "$tag" >/dev/null 2>&1 \
+            || gh release create "$tag" --title "$tag" \
+                 --notes "Automated build of $tag (see MANIFEST.txt for hashes)."
+          gh release upload "$tag" images/* --clobber

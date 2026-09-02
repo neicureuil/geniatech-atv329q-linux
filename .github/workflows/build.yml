@@ -7,7 +7,9 @@ on:
   push:
     branches: [main]
     tags: ['v*']
-  pull_request:
+  # No pull_request trigger: a full Buildroot build is far too expensive to run
+  # on every PR. Building a branch is done on demand -- pick it in the "Run
+  # workflow" dialog (available once this file is on the default branch).
   workflow_dispatch:
     inputs:
       screen:
@@ -29,34 +31,7 @@ env:
   BUILDROOT_REF: '2024.02.10'
 
 jobs:
-  # Fast gate: catches a broken defconfig or BR2_EXTERNAL wiring in ~2 minutes
-  # instead of failing 40 minutes into the real build. `make defconfig` is
-  # offline, so this downloads nothing beyond a shallow Buildroot clone.
-  config:
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          path: atv329q
-
-      - name: Clone Buildroot ${{ env.BUILDROOT_REF }}
-        run: git clone --depth 1 --branch "$BUILDROOT_REF"
-             https://github.com/buildroot/buildroot.git buildroot
-
-      - name: Resolve the defconfig
-        working-directory: buildroot
-        run: |
-          make O="$RUNNER_TEMP/cfg" \
-               BR2_EXTERNAL="$GITHUB_WORKSPACE/atv329q" \
-               BR2_DEFCONFIG="$GITHUB_WORKSPACE/atv329q/configs/atv329q_defconfig" \
-               defconfig
-          echo "--- board symbols as resolved ---"
-          grep -E '^(BR2_PACKAGE_(ATV329Q_SCREEN|DOCKER_BIN)|BR2_LINUX_KERNEL_CUSTOM_REPO_VERSION|BR2_TARGET_ROOTFS_EXT2_SIZE)' \
-               "$RUNNER_TEMP/cfg/.config"
-
   build:
-    needs: config
     runs-on: ubuntu-latest
     permissions:
       contents: write   # only to attach images to a tagged release

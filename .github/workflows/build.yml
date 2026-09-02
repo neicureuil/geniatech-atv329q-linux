@@ -35,8 +35,10 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write   # only to attach images to a tagged release
-    # A cold build (internal glibc toolchain + kernel + packages) is long.
-    timeout-minutes: 240
+    # Measured: 1h30 for a cold build (internal glibc toolchain + kernel +
+    # packages, empty dl/ and ccache). 150 leaves room for a slower runner or
+    # an expired cache while still killing a hung job in reasonable time.
+    timeout-minutes: 150
 
     env:
       # For anything other than a manual run, build the full default image.

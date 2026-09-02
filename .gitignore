@@ -11,3 +11,9 @@
 
 # macOS
 .DS_Store
+
+# Vendor partition backups (raw dumps, one directory per board).
+# They hold PER-BOARD data (IMEI in modemst1/2, MAC and serial in params, radio
+# calibration in persist) and proprietary firmware (50 MiB of MPSS in modem).
+# They must never enter the repository.
+/backup/

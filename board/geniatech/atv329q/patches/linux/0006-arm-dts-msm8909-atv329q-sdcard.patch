@@ -1,0 +1,112 @@
+ARM: dts: qcom: atv329q enable the microSD slot (sdhc_2)
+
+The board has a microSD slot -- the vendor recovery's fstab mounts
+/dev/block/mmcblk1p1 as /sdcard -- but the mainline port never enabled it.
+sdhc_2 stayed `status = "disabled"`, so there is no /dev/mmcblk1 and only the
+eMMC controller ever probes.
+
+Nothing was missing on the kernel side: MMC_SDHCI_MSM is already built in, and
+qcom-msm8909.dtsi fully describes the controller (registers, interrupts,
+clocks, resets, the sdc2_{clk,cmd,data}_{on,off} pinctrl states, bus-width =
+<4>). Only the board wiring was absent. It is taken from the vendor device
+tree, extracted from the recovery partition:
+
+  - vmmc/vqmmc: qcom-msm8909-pm8909.dtsi already routes vmmc from pm8909_l11
+    but pairs it with l12 for vqmmc, which is the generic MSM8909 reference
+    wiring. The vendor DT for this board points BOTH vdd-supply and
+    vdd-io-supply at l11 (2.8-2.95 V), so vqmmc is overridden rather than
+    powering an unrelated rail. l11 already carries regulator-system-load and
+    regulator-allow-set-load in this DTS.
+
+  - card detect on TLMM gpio38 (vendor: cd-gpios = <&tlmm 38 1>, and its
+    sdhc2_cd_pin group belongs to the active pinctrl set). gpio38 is otherwise
+    unused on this board.
+
+  - no-1-8-v: the vendor sets qcom,no-1p8v, so the slot has no 1.8 V
+    signalling and no UHS mode is reachable -- high speed at 2.95 V is the
+    ceiling.
+
+The card-detect polarity was the one value the device tree could not settle:
+the vendor declares the line active-low yet biases the pin pull-down, which
+only adds up if the board carries an external pull-up. Active-low was kept as
+the vendor states it, and hardware confirms it -- a card inserted 230 s into
+the boot was picked up, so hot-plug detection works:
+
+  sdhci_msm 7864900.sdhci: Got CD GPIO
+  mmc1: SDHCI controller on 7864900.sdhci [7864900.sdhci] using ADMA
+  mmc1: new high speed SDHC card at address aaaa
+  mmcblk1: mmc1:aaaa SC16G 14.8 GiB
+
+"high speed" and not a UHS mode, as expected from no-1-8-v. Both a vfat and an
+ext4 partition on the card mount and read correctly.
+
+diff --git a/arch/arm/boot/dts/qcom/qcom-msm8909-geniatech-atv329q.dts b/arch/arm/boot/dts/qcom/qcom-msm8909-geniatech-atv329q.dts
+--- a/arch/arm/boot/dts/qcom/qcom-msm8909-geniatech-atv329q.dts
++++ b/arch/arm/boot/dts/qcom/qcom-msm8909-geniatech-atv329q.dts
+@@ -199,6 +199,48 @@
+ 	status = "okay";
+ };
+ 
++/*
++ * microSD slot (vendor: sdhci@07864000; its recovery fstab mounts
++ * /dev/block/mmcblk1p1 as /sdcard).  The controller itself is fully described
++ * in qcom-msm8909.dtsi -- registers, interrupts, clocks, resets, the
++ * sdc2_{clk,cmd,data}_{on,off} pinctrl states and bus-width = <4>; only the
++ * board wiring is missing.
++ *
++ * qcom-msm8909-pm8909.dtsi already supplies vmmc from pm8909_l11, but pairs it
++ * with l12 for vqmmc -- that is the generic MSM8909 reference wiring.  On this
++ * board the vendor DT points BOTH vdd-supply and vdd-io-supply at l11
++ * (2.8-2.95 V), so override vqmmc rather than power an unrelated rail.
++ */
++&sdhc_2 {
++	vmmc-supply = <&pm8909_l11>;
++	vqmmc-supply = <&pm8909_l11>;
++
++	/*
++	 * Card detect on TLMM gpio38 (vendor: cd-gpios = <&tlmm 38 1>, with the
++	 * sdhc2_cd_pin group part of the active pinctrl set).
++	 *
++	 * Active-low is confirmed on hardware: a card inserted 230 s into the
++	 * boot was picked up ("mmc1: new high speed SDHC card"), so hot-plug
++	 * detection works with this polarity.  The vendor biases the pin
++	 * pull-down while declaring the line active-low, which only adds up if
++	 * the board carries an external pull-up -- it evidently does.  Should
++	 * the line ever prove unreliable, `broken-cd` (polling) is the fallback.
++	 */
++	cd-gpios = <&tlmm 38 GPIO_ACTIVE_LOW>;
++
++	pinctrl-names = "default", "sleep";
++	pinctrl-0 = <&sdc2_clk_on &sdc2_cmd_on &sdc2_data_on &sdc2_cd_default>;
++	pinctrl-1 = <&sdc2_clk_off &sdc2_cmd_off &sdc2_data_off &sdc2_cd_default>;
++
++	/*
++	 * The vendor sets qcom,no-1p8v: this slot has no 1.8 V signalling, so no
++	 * UHS mode is reachable.  High speed at 2.95 V is the ceiling.
++	 */
++	no-1-8-v;
++
++	status = "okay";
++};
++
+ /* WiFi: WCNSS/Pronto + IRIS (wcn3620) -> wcn36xx. Network channel independent
+  * of the (non-probing) USB controller. */
+ &wcnss {
+@@ -282,6 +324,17 @@
+ 		bias-pull-up;
+ 	};
+ 
++	/*
++	 * microSD card detect (vendor: sdhc2_cd_pin -- gpio38, function gpio,
++	 * drive-strength 2, bias-pull-down).
++	 */
++	sdc2_cd_default: sdc2-cd-default-state {
++		pins = "gpio38";
++		function = "gpio";
++		drive-strength = <2>;
++		bias-pull-down;
++	};
++
+ 	/* ADV7533 interrupt line (vendor: irq-gpio = gpio31). */
+ 	adv7533_int_default: adv7533-int-default-state {
+ 		pins = "gpio31";

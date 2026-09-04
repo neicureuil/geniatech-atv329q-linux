@@ -1,0 +1,17 @@
+# Everything in this tree is consumed on Linux: Buildroot's make, the host
+# hooks (post-build.sh, post-image.sh), the kernel patch stack, and the init
+# scripts that ship inside the rootfs overlay and end up running on the board.
+#
+# Git for Windows enables core.autocrlf=true in its *system* config, so a plain
+# clone rewrites every checkout to CRLF. That breaks, in order of how long it
+# takes to notice:
+#
+#   - shebangs        -> "/usr/bin/env: 'bash\r': No such file or directory"
+#   - makefiles       -> package .mk files silently misparse
+#   - overlay init    -> S12wifi / S60dockerd are copied into the rootfs as-is
+#                        and never run on the target, with no build-time error
+#
+# -text disables end-of-line conversion entirely: files land in the working
+# tree exactly as stored, on every platform. It is also the safe choice for the
+# binary payloads here (WCNSS firmware, dummy-ramdisk.cpio.gz).
+* -text

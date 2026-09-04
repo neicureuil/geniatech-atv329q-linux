@@ -1,0 +1,79 @@
+ARM: dts: qcom: msm8909 APSS watchdog node
+
+CONFIG_QCOM_WDT is already built in, but nothing ever bound to it: msm8909.dtsi
+carries no watchdog node, so there is no /dev/watchdog and an unattended board
+has no way to recover from a hang on its own. That matters more now that the
+product is used headless -- there is no screen to notice a freeze on, and no
+one on site to power-cycle.
+
+The block does exist. The vendor device tree, extracted from the recovery
+partition, declares:
+
+  qcom,wdt@b017000 {
+      compatible = "qcom,msm-watchdog";
+      reg = <0xb017000 0x1000>;
+      interrupts = <0 3 0  0 4 0>;   /* bark, bite */
+      qcom,bark-time = <11000>;
+      qcom,pet-time  = <10000>;
+  };
+
+Upstream has no node for this family -- msm8916, msm8939 and msm8953 all lack
+one -- so this is modelled on qcs404, the closest SoC that does carry it, which
+uses the same 0xb017000 window and the same sleep clock. ipq5018 confirms the
+bark interrupt convention, GIC_SPI 3 IRQ_TYPE_EDGE_RISING, matching the SPI 3
+the vendor declares.
+
+The binding has no qcom,apss-wdt-msm8909 entry yet, so the driver matches on
+the generic qcom,kpss-wdt fallback. The SoC-specific string is kept first: it
+documents the hardware and is what an upstream submission would add to the
+binding.
+
+The bark interrupt is optional as far as the driver is concerned
+(platform_get_irq_optional), and wiring it buys a pretimeout message in the log
+just before the bite resets the board.
+
+This change is inert on its own, by design:
+
+  - CONFIG_WATCHDOG_OPEN_TIMEOUT=0, so nothing arms the watchdog unless
+    userspace opens /dev/watchdog;
+  - CONFIG_WATCHDOG_HANDLE_BOOT_ENABLED=y, so if the bootloader left it running
+    the kernel keeps petting it rather than letting it fire;
+  - CONFIG_WATCHDOG_NOWAYOUT is off, so a clean close stops it.
+
+It only exposes the device. Actually arming it -- busybox has the `watchdog`
+applet, so no new package is needed -- is a separate decision, because a daemon
+that misses its deadline turns a slow box into a rebooting one.
+
+diff --git a/arch/arm/boot/dts/qcom/qcom-msm8909.dtsi b/arch/arm/boot/dts/qcom/qcom-msm8909.dtsi
+--- a/arch/arm/boot/dts/qcom/qcom-msm8909.dtsi
++++ b/arch/arm/boot/dts/qcom/qcom-msm8909.dtsi
+@@ -1529,6 +1529,29 @@
+ 			};
+ 		};
+ 
++		/*
++		 * APSS watchdog.  Upstream does not describe it for this family --
++		 * msm8916, msm8939 and msm8953 all lack the node -- but the block is
++		 * there: the vendor DT declares qcom,wdt@b017000 over the same 4 KiB
++		 * window, with bark on SPI 3 and bite on SPI 4.  Modelled on qcs404,
++		 * the closest SoC that does carry the node upstream.
++		 *
++		 * The binding has no qcom,apss-wdt-msm8909 yet, so the driver matches
++		 * on the generic qcom,kpss-wdt fallback; the SoC-specific string
++		 * documents the hardware and is what an upstream submission would add.
++		 *
++		 * The bark interrupt is optional (platform_get_irq_optional), and
++		 * wiring it buys a pretimeout message in the log just before the bite
++		 * resets the board.  On a headless box that line is often the only
++		 * clue left behind by a hang.
++		 */
++		watchdog@b017000 {
++			compatible = "qcom,apss-wdt-msm8909", "qcom,kpss-wdt";
++			reg = <0x0b017000 0x1000>;
++			clocks = <&sleep_clk>;
++			interrupts = <GIC_SPI 3 IRQ_TYPE_EDGE_RISING>;
++		};
++
+ 		timer@b020000 {
+ 			compatible = "arm,armv7-timer-mem";
+ 			reg = <0x0b020000 0x1000>;

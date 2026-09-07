@@ -18,17 +18,23 @@ case "$1" in
       # 2) wait for wlan0 (WCNSS boot + wcn36xx probe take a few seconds)
       for i in $(seq 1 30); do [ -d /sys/class/net/wlan0 ] && break; sleep 1; done
       [ -d /sys/class/net/wlan0 ] || exit 0
-      # 2b) wcn36xx exposes a zero MAC (NV has no valid one) -> "ip link set up"
-      #     fails "Cannot assign requested address". Give wlan0 a stable
-      #     locally-administered MAC derived from eth0 (unique per board).
+      # 2b) wcn36xx exposes a zero MAC (the NV carries no valid one) -> "ip link
+      #     set up" fails with "Cannot assign requested address". Take the
+      #     address S09identity resolved for this board: the factory MAC from
+      #     params, or one derived from the eMMC CID if params was wiped.
+      #
+      #     This used to derive the MAC from eth0, and fall back to a hardcoded
+      #     02:00:5e:a3:29:71 when eth0 was absent -- the same value on every
+      #     board, i.e. a guaranteed collision as soon as two units shared a
+      #     network. It also tied wlan0 to a USB NIC that enumerates late.
       if [ "$(cat /sys/class/net/wlan0/address 2>/dev/null)" = "00:00:00:00:00:00" ]; then
-        eth=$(cat /sys/class/net/eth0/address 2>/dev/null)
-        if [ -n "$eth" ] && [ "$eth" != "00:00:00:00:00:00" ]; then
-          mac="$(printf '%02x' $(( 0x${eth%%:*} | 2 ))):${eth#*:}"
+        [ -r /run/board-identity ] && . /run/board-identity
+        if [ -n "$BOARD_WIFI_MAC" ]; then
+          ip link set wlan0 address "$BOARD_WIFI_MAC" 2>/dev/null
         else
-          mac="02:00:5e:a3:29:71"
+          echo "S12wifi: no MAC resolved for this board, leaving wlan0 down" >&2
+          exit 0
         fi
-        ip link set wlan0 address "$mac" 2>/dev/null
       fi
       # 3) associate (nl80211 backend) + DHCP on wlan0 only
       ip link set wlan0 up 2>/dev/null

@@ -20,5 +20,19 @@ rm -f "${TARGET_DIR}/usr/sbin/sshd"
 	exit 1
 }
 
+# btmgmt is what sets this board's own Bluetooth address at boot (S35btaddr).
+# bluez builds it but its `make install` does not ship it, so it has to be
+# copied by hand -- Buildroot does exactly the same for gatttool, through a
+# post-install hook. BUILD_DIR is exported to post-build scripts.
+BTMGMT=$(echo "${BUILD_DIR}"/bluez5_utils-*/tools/btmgmt)
+if [ -x "${BTMGMT}" ]; then
+	install -D -m 0755 "${BTMGMT}" "${TARGET_DIR}/usr/bin/btmgmt"
+	echo "post-build: btmgmt installed from $(basename "$(dirname "$(dirname "${BTMGMT}")")")"
+else
+	echo "post-build: btmgmt not found under ${BUILD_DIR}/bluez5_utils-*/tools" >&2
+	echo "post-build: hci0 would keep whatever address the controller reports" >&2
+	exit 1
+fi
+
 echo "post-build: dropbear kept as sshd, sftp-server installed"
 

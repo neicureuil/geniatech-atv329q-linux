@@ -1,0 +1,136 @@
+#!/bin/sh
+# Resolve this board's identity once, early, into /run/board-identity.
+#
+# Three values are per-unit and must never be shared across a fleet: the serial,
+# the WiFi MAC and the Bluetooth address. They are resolved here so that a
+# single image serves every board, and so that later scripts (S12wifi,
+# S35btaddr) just source the answer instead of each inventing one.
+#
+# Resolution order, best source first:
+#
+#   1. Factory values. The vendor left them on the board: persist (p23) holds
+#      bluetooth/.bt_nv.bin, and params (p27) holds a GENIATECH! record with the
+#      serial and a factory MAC. These are the real, assigned values.
+#
+#   2. Derived from the eMMC CID. The CID is a read-only register inside the
+#      eMMC chip, written at manufacture -- it is not on the media, so no
+#      formatting, no partition wipe and no full EDL reflash can erase it. We
+#      hash it and build locally-administered addresses from the digest.
+#
+#   3. Nothing. We log loudly and leave the value empty.
+#
+# Level 3 is deliberate. The previous behaviour was worse than failing: S12wifi
+# fell back to a hardcoded 02:00:5e:a3:29:71, identical on every board, which
+# guarantees a MAC collision the moment two units share a network. An interface
+# that refuses to come up and says so is easier to diagnose than two boxes
+# silently fighting over an address.
+#
+# The derived addresses are:
+#   - locally administered and unicast (first octet 0x02 / 0x06), so they can
+#     never collide with a real OUI;
+#   - deterministic, so a board keeps the same address across reboots and
+#     reflashes -- Bluetooth pairings and DHCP leases survive;
+#   - distinct per interface, so WiFi and Bluetooth never share one.
+
+OUT=/run/board-identity
+PERSIST=/dev/mmcblk0p23
+PARAMS=/dev/mmcblk0p27
+CID_FILE=/sys/class/mmc_host/mmc0/mmc0:0001/cid
+MNT=/tmp/.persist.$$
+
+log() { echo "S09identity: $*"; }
+
+# 5 bytes of a sha256 over the eMMC CID, as "aa:bb:cc:dd:ee".
+derived_suffix() {
+	cid=$(cat "$CID_FILE" 2>/dev/null)
+	[ -n "$cid" ] || return 1
+	h=$(printf '%s' "$cid" | sha256sum | cut -c1-10)
+	echo "$h" | sed 's/\(..\)\(..\)\(..\)\(..\)\(..\)/\1:\2:\3:\4:\5/'
+}
+
+# .bt_nv.bin is a 9-byte TLV: 01 01 06 followed by the address, little-endian.
+bt_from_persist() {
+	f="$MNT/bluetooth/.bt_nv.bin"
+	[ -f "$f" ] || return 1
+	set -- $(od -An -tx1 -j3 -N6 "$f" 2>/dev/null)
+	[ $# -eq 6 ] || return 1
+	echo "$6:$5:$4:$3:$2:$1"
+}
+
+# params holds "GENIATECH!", then the serial, then a MAC, as plain strings.
+params_field() {
+	dd if="$PARAMS" bs=1 count=256 2>/dev/null | strings | sed -n "$1p"
+}
+
+start() {
+	mkdir -p /run
+	: > "$OUT"
+
+	# --- factory sources -------------------------------------------------
+	bt=""
+	serial=""
+	factory_mac=""
+
+	mkdir -p "$MNT"
+	if mount -o ro,noload "$PERSIST" "$MNT" 2>/dev/null; then
+		bt=$(bt_from_persist) || bt=""
+		umount "$MNT" 2>/dev/null
+	else
+		log "persist ($PERSIST) not mountable"
+	fi
+	rmdir "$MNT" 2>/dev/null
+
+	if [ "$(params_field 1)" = "GENIATECH!" ]; then
+		serial=$(params_field 2)
+		factory_mac=$(params_field 3)
+	else
+		log "params ($PARAMS) has no GENIATECH! record"
+	fi
+
+	# --- fall back to the eMMC CID ---------------------------------------
+	suffix=$(derived_suffix) || suffix=""
+
+	wifi="$factory_mac"
+	wifi_src="params"
+	if [ -z "$wifi" ]; then
+		if [ -n "$suffix" ]; then
+			wifi="02:$suffix"; wifi_src="derived from eMMC CID"
+		else
+			wifi_src="UNRESOLVED"
+		fi
+	fi
+
+	bt_src="persist"
+	if [ -z "$bt" ]; then
+		if [ -n "$suffix" ]; then
+			bt="06:$suffix"; bt_src="derived from eMMC CID"
+		else
+			bt_src="UNRESOLVED"
+		fi
+	fi
+
+	if [ -z "$serial" ]; then
+		cid=$(cat "$CID_FILE" 2>/dev/null)
+		[ -n "$cid" ] && serial="emmc-$cid"
+	fi
+
+	{
+		echo "BOARD_SERIAL='$serial'"
+		echo "BOARD_WIFI_MAC='$wifi'"
+		echo "BOARD_BT_ADDR='$bt'"
+	} > "$OUT"
+
+	log "serial $serial"
+	log "wifi   ${wifi:-<none>} ($wifi_src)"
+	log "bt     ${bt:-<none>} ($bt_src)"
+
+	[ -n "$wifi" ] || log "WARNING: no WiFi MAC could be resolved; wlan0 will not be configured"
+	[ -n "$bt" ]   || log "WARNING: no Bluetooth address could be resolved; hci0 will keep whatever it has"
+}
+
+case "$1" in
+	start) start ;;
+	stop) : ;;
+	restart|reload) start ;;
+	*) echo "Usage: $0 {start|stop|restart}"; exit 1 ;;
+esac

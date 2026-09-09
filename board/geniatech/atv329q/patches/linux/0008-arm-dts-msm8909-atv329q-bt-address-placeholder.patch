@@ -1,0 +1,79 @@
+ARM: dts: qcom: atv329q keep a placeholder Bluetooth address
+
+The DTS carried local-bd-address = [ca 95 9b e3 00 02], i.e. an invented
+02:00:E3:9B:95:CA, baked into every board built from this image while the real
+address for this unit sat unused in persist/bluetooth/.bt_nv.bin. A first
+attempt (this same patch, earlier revision) dropped the property outright, on
+the reasoning that btqcomsmd implements hdev->set_bdaddr and the address could
+be applied at runtime instead. Measured on hardware, that does not work:
+
+  Bluetooth: hci0: Opcode 0x1001 failed: -110
+  Bluetooth: hci0: command 0x1001 tx timeout
+
+Without any address, hci0 never comes up at all (ACL MTU stays 0:0), so no
+runtime tool -- btmgmt included -- can act on it afterwards. The WCNSS firmware
+appears to need an address handed to it during bring-up to complete its own
+init handshake; which address does not seem to matter, only that one exists.
+
+So the property stays, but as a neutral placeholder shared by every board
+rather than a per-board value. With it present, hci0 initialises normally
+(ACL MTU 1024:7) and the real, per-board address is then applied at runtime:
+
+  - S09identity (added alongside this patch) resolves it -- persist first,
+    then derived from the eMMC CID if persist was wiped;
+  - S35btaddr brings hci0 down, calls `btmgmt public-addr`, and brings it back
+    up. Confirmed on hardware: hci0 comes back reporting the correct address.
+
+That keeps a single image working across a fleet without baking any one board
+real identity into the DTB, while working around the firmware requiring an
+address to exist at all during init.
+
+Verified: dtc returns 0 with no new warnings (23 before and after), and the
+placeholder lands in the produced blob as local-bd-address = [00 00 00 00 00
+02].
+
+diff --git a/arch/arm/boot/dts/qcom/qcom-msm8909-geniatech-atv329q.dts b/arch/arm/boot/dts/qcom/qcom-msm8909-geniatech-atv329q.dts
+--- a/arch/arm/boot/dts/qcom/qcom-msm8909-geniatech-atv329q.dts
++++ b/arch/arm/boot/dts/qcom/qcom-msm8909-geniatech-atv329q.dts
+@@ -251,13 +251,35 @@
+ 	compatible = "qcom,wcn3620";
+ };
+ 
+-/* Bluetooth: WCNSS hosts BT on the same Pronto core as WiFi -> btqcomsmd bridges
+- * HCI over the WCNSS_CTRL SMD channel (qcom,wcnss-bt node is in the .dtsi). The
+- * WCNSS has no persistent BD address storage, so supply a fixed (locally
+- * administered) one via the firmware property. Bytes are LITTLE-ENDIAN, i.e.
+- * reversed vs the displayed address 02:00:E3:9B:95:CA. */
++/*
++ * Bluetooth: WCNSS hosts BT on the same Pronto core as WiFi, and btqcomsmd
++ * bridges HCI over the WCNSS_CTRL SMD channel (the qcom,wcnss-bt node lives in
++ * the .dtsi).
++ *
++ * local-bd-address is kept, but as a NEUTRAL PLACEHOLDER shared by every
++ * board, not a per-board value -- measured on hardware that it has to be
++ * present at all. Dropping the property outright (tried first) leaves the
++ * controller answering BDADDR_ANY, and the very first HCI command times out:
++ *
++ *   Bluetooth: hci0: Opcode 0x1001 failed: -110
++ *   Bluetooth: hci0: command 0x1001 tx timeout
++ *
++ * hci0 never comes up at all in that state (ACL MTU 0:0), so nothing --
++ * btmgmt included -- can act on it afterwards. The WCNSS firmware apparently
++ * needs an address handed to it during bring-up to complete its own init
++ * handshake; which address does not seem to matter, only that one exists.
++ *
++ * With the placeholder present, hci0 initialises normally (ACL MTU 1024:7),
++ * and S35btaddr then overrides it at runtime with the real address for this
++ * board, resolved by S09identity -- confirmed on hardware: down, btmgmt
++ * public-addr, up, and hci0 comes back reporting the correct address. That
++ * keeps a single image working across a fleet without baking any board real
++ * identity into the DTB.
++ *
++ * Bytes are LITTLE-ENDIAN, i.e. reversed vs the address as displayed.
++ */
+ &wcnss_bt {
+-	local-bd-address = [ ca 95 9b e3 00 02 ];
++	local-bd-address = [ 00 00 00 00 00 02 ];
+ };
+ 
+ /* USB OTG (micro-USB = device for adb/gadget ; USB-A = host when ID floats) */

@@ -1,0 +1,66 @@
+#!/bin/sh
+# Give hci0 this board's own Bluetooth address, before anything powers it on.
+#
+# The device tree still carries local-bd-address, but as a neutral placeholder
+# shared by every board rather than a per-board value -- see patch 0008 for why
+# it has to be present at all: without it hci0 never comes up (the WCNSS
+# firmware seems to need an address handed to it during bring-up to complete
+# its own init). The Bluetooth core reads that property through
+# hci_dev_get_bd_addr_from_property(), which is what gets hci0 initialised in
+# the first place; this script then corrects it to the real, per-board value.
+#
+# btqcomsmd implements hdev->set_bdaddr (via qca_set_bdaddr_rome), so the
+# correction happens at runtime rather than at build time. This has to run
+# after S10wcnss has booted the radio and hci0 has appeared, but before
+# S40bluetoothd powers the adapter up.
+#
+# btmgmt is built by bluez but not installed by its make install; post-build.sh
+# copies it in, the same way Buildroot handles gatttool.
+
+IDENTITY=/run/board-identity
+
+log() { echo "S35btaddr: $*"; }
+
+start() {
+	[ -r "$IDENTITY" ] || { log "no $IDENTITY (S09identity did not run?)"; exit 0; }
+	. "$IDENTITY"
+
+	if [ -z "$BOARD_BT_ADDR" ]; then
+		log "no address resolved for this board; leaving hci0 as-is"
+		exit 0
+	fi
+
+	command -v btmgmt >/dev/null 2>&1 || { log "btmgmt missing; cannot set the address"; exit 0; }
+
+	# hci0 only shows up once the WCNSS remoteproc is running, a few seconds in.
+	i=0
+	while [ $i -lt 30 ]; do
+		[ -d /sys/class/bluetooth/hci0 ] && break
+		i=$((i + 1)); sleep 1
+	done
+	[ -d /sys/class/bluetooth/hci0 ] || { log "hci0 never appeared; giving up"; exit 0; }
+
+	current=$(hciconfig hci0 2>/dev/null | sed -n 's/.*BD Address: \([0-9A-Fa-f:]*\).*/\1/p')
+	if [ "$(echo "$current" | tr 'A-Z' 'a-z')" = "$(echo "$BOARD_BT_ADDR" | tr 'A-Z' 'a-z')" ]; then
+		log "hci0 already at $current"
+		exit 0
+	fi
+
+	# Confirmed on hardware: `btmgmt public-addr` succeeds here even though
+	# hci0 is already fully initialised (unlike the BDADDR_ANY case, where the
+	# controller stays unregistered and no index is ever assigned to act on).
+	hciconfig hci0 down 2>/dev/null
+	if btmgmt --index 0 public-addr "$BOARD_BT_ADDR" >/dev/null 2>&1; then
+		log "set hci0 to $BOARD_BT_ADDR (was ${current:-unknown})"
+	else
+		log "btmgmt refused $BOARD_BT_ADDR; hci0 stays at ${current:-unknown}"
+	fi
+	hciconfig hci0 up 2>/dev/null
+}
+
+case "$1" in
+	start) start ;;
+	stop) : ;;
+	restart|reload) start ;;
+	*) echo "Usage: $0 {start|stop|restart}"; exit 1 ;;
+esac
